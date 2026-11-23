@@ -3753,6 +3753,10 @@ static void frontend_unix_get_env(int *argc,
                   path_mkdir(g_defaults.dirs[DEFAULT_DIR_CORE_INFO]);
                if (!path_is_directory(user_cores_dir))
                   path_mkdir(user_cores_dir);
+               /* Load Content and other browsing start in Download */
+               fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_MENU_CONTENT],
+                     internal_storage_path, "Download",
+                     sizeof(g_defaults.dirs[DEFAULT_DIR_MENU_CONTENT]));
                android_tv_lite_unpack_core_zips(user_cores_dir,
                      g_defaults.dirs[DEFAULT_DIR_CORE_INFO]);
                android_tv_lite_import_cores(user_cores_dir,

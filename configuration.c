@@ -8164,6 +8164,13 @@ static bool config_load_file(const char *path, settings_t *settings)
     * the main menu, also for configs saved by an earlier build */
    settings->bools.menu_mouse_enable        = true;
    settings->bools.menu_show_quit_retroarch = true;
+   /* File browsing starts in <storage>/Download unless a start folder
+    * was chosen */
+   if (     !*settings->paths.directory_menu_content
+         && *g_defaults.dirs[DEFAULT_DIR_MENU_CONTENT])
+      configuration_set_string(settings,
+            settings->paths.directory_menu_content,
+            g_defaults.dirs[DEFAULT_DIR_MENU_CONTENT]);
    /* Controller: L1+R1 opens the menu unless another combo was chosen */
    if (settings->uints.input_menu_toggle_gamepad_combo == INPUT_COMBO_NONE)
       settings->uints.input_menu_toggle_gamepad_combo = INPUT_COMBO_L_R;

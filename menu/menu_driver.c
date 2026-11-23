@@ -3850,23 +3850,25 @@ static uint8_t menu_first_run_scan(settings_t *settings)
 }
 
 #ifdef RARCH_TV_LITE
-/* Whether @dir holds no core info file. The core info cache lives in
+/* Whether @dir lacks the core info files. The core info cache lives in
  * the same folder, so an empty-folder test is not enough. */
 static bool menu_tv_lite_info_missing(const char *dir)
 {
-   bool missing = true;
+   /* A few .info files can come from core zips (the cores folder);
+    * the full set from libretro has hundreds */
+   unsigned found = 0;
    struct RDIR *rdir;
 
    if (!*dir || !(rdir = retro_opendir(dir)))
       return true;
-   while (missing && retro_readdir(rdir))
+   while (found < 20 && retro_readdir(rdir))
    {
       const char *name = retro_dirent_get_name(rdir);
       if (name && string_ends_with(name, ".info"))
-         missing = false;
+         found++;
    }
    retro_closedir(rdir);
-   return missing;
+   return found < 20;
 }
 #endif
 

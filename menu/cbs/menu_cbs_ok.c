@@ -1640,7 +1640,14 @@ int generic_action_ok_displaylist_push(
          filebrowser_clear_type();
          info.type          = type;
          info.directory_ptr = idx;
+#ifdef RARCH_TV_LITE
+         /* TV Lite: a core to install is browsed for from Download */
+         info_path          = *settings->paths.directory_menu_content
+               ? settings->paths.directory_menu_content
+               : settings->paths.directory_core_assets;
+#else
          info_path          = settings->paths.directory_core_assets;
+#endif
          info_label         = label;
          dl_type            = DISPLAYLIST_FILE_BROWSER_SELECT_FILE;
          break;
