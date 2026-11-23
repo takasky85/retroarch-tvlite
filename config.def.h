@@ -1040,7 +1040,7 @@
 
 /* Share 'Import Content' values */
 #if defined(HAVE_NETWORKING)
-#if defined(_3DS)
+#if defined(_3DS) || defined(RARCH_TV_LITE)
 #define DEFAULT_CONTENT_SHOW_NETPLAY MENU_ADD_CONTENT_ENTRY_DISPLAY_HIDDEN
 #else
 #define DEFAULT_CONTENT_SHOW_NETPLAY MENU_ADD_CONTENT_ENTRY_DISPLAY_PLAYLISTS_TAB
@@ -1876,7 +1876,12 @@
  * replaced core is moved into the backups as it is) */
 #define DEFAULT_CORE_UPDATER_AUTO_BACKUP_COMPRESS true
 
+#if defined(RARCH_TV_LITE)
+/* TV Lite: fetch thumbnails automatically */
+#define DEFAULT_NETWORK_ON_DEMAND_THUMBNAILS true
+#else
 #define DEFAULT_NETWORK_ON_DEMAND_THUMBNAILS false
+#endif
 
 /* Number of entries that will be kept in content history playlist file. */
 #define DEFAULT_CONTENT_HISTORY_SIZE 200

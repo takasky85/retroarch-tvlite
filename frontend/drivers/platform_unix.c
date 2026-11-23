@@ -3037,6 +3037,65 @@ static size_t frontend_unix_get_os(char *s,
    return _len;
 }
 
+#if defined(ANDROID) && defined(RARCH_TV_LITE)
+#include <sys/stat.h>
+
+/* TV Lite: Android loads cores only from the app's own folder (shared
+ * storage is mounted noexec, and android_core_path_resolve() refuses
+ * anything else), so the cores folder the user can see and fill,
+ * <storage>/RetroArch/cores, is brought into it at startup.  A core is
+ * copied when the app has none of that name, or when the user's copy
+ * differs in size or is newer. */
+static void android_tv_lite_import_cores(const char *src, const char *dst)
+{
+   struct RDIR *dir;
+
+   if (     !*src || !*dst
+         || string_is_equal(src, dst)
+         || !path_is_directory(src))
+      return;
+   if (!path_is_directory(dst) && !path_mkdir(dst))
+      return;
+   if (!(dir = retro_opendir(src)))
+      return;
+
+   while (retro_readdir(dir))
+   {
+      char src_path[PATH_MAX_LENGTH];
+      char dst_path[PATH_MAX_LENGTH];
+      struct stat st_src;
+      struct stat st_dst;
+      const char *name = retro_dirent_get_name(dir);
+      size_t _len;
+
+      if (!name || retro_dirent_is_dir(dir, NULL))
+         continue;
+      _len = strlen(name);
+      if (_len < 4 || strcmp(name + _len - 3, ".so"))
+         continue;
+
+      fill_pathname_join_special(src_path, src, name, sizeof(src_path));
+      fill_pathname_join_special(dst_path, dst, name, sizeof(dst_path));
+
+      if (stat(src_path, &st_src) != 0 || !S_ISREG(st_src.st_mode))
+         continue;
+      if (     stat(dst_path, &st_dst) == 0
+            && st_dst.st_size  == st_src.st_size
+            && st_dst.st_mtime >= st_src.st_mtime)
+         continue;
+
+      if (filestream_copy(src_path, dst_path) == 0)
+         __android_log_print(ANDROID_LOG_INFO, "RetroArch",
+               "[TV Lite] Installed core \"%s\".\n", name);
+      else
+         __android_log_print(ANDROID_LOG_WARN, "RetroArch",
+               "[TV Lite] Could not install core \"%s\".\n", name);
+   }
+
+   retro_closedir(dir);
+}
+#endif
+
 #ifdef HAVE_LAKKA
 static void frontend_unix_get_lakka_version(char *s,
       size_t len)
@@ -3546,6 +3605,30 @@ static void frontend_unix_get_env(int *argc,
                   parent_path, "temp",
                   sizeof(g_defaults.dirs[DEFAULT_DIR_CACHE]));
 
+#ifdef RARCH_TV_LITE
+            /* TV Lite: core info files live in <storage>/RetroArch/info
+             * and the user's cores in <storage>/RetroArch/cores, both
+             * easy to reach from a file manager or over USB.  Only
+             * when shared storage is writable: otherwise parent_path
+             * is the app folder, which already holds both. */
+            if (storage_permissions != INTERNAL_STORAGE_NOT_WRITABLE)
+            {
+               char user_cores_dir[PATH_MAX_LENGTH];
+
+               fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CORE_INFO],
+                     parent_path, "info",
+                     sizeof(g_defaults.dirs[DEFAULT_DIR_CORE_INFO]));
+               fill_pathname_join(user_cores_dir,
+                     parent_path, "cores", sizeof(user_cores_dir));
+               if (!path_is_directory(g_defaults.dirs[DEFAULT_DIR_CORE_INFO]))
+                  path_mkdir(g_defaults.dirs[DEFAULT_DIR_CORE_INFO]);
+               if (!path_is_directory(user_cores_dir))
+                  path_mkdir(user_cores_dir);
+               android_tv_lite_import_cores(user_cores_dir,
+                     g_defaults.dirs[DEFAULT_DIR_CORE]);
+            }
+#endif
+
             __android_log_print(ANDROID_LOG_INFO,
                "RetroArch", "[ENV] Default savefile folder: \"%s\".",
                g_defaults.dirs[DEFAULT_DIR_SRAM]);
@@ -3635,8 +3718,13 @@ static void frontend_unix_get_env(int *argc,
     *
     * */
 
+#ifdef RARCH_TV_LITE
+   /* TV Lite: always a TV, driven by remote, mouse or gamepad */
+   if (true)
+#else
    if (     (g_platform_android_flags & PLAT_ANDROID_FLAG_GAME_CONSOLE_DEVICE)
          || (g_platform_android_flags & PLAT_ANDROID_FLAG_ANDROID_TV_DEVICE))
+#endif
    {
       g_defaults.overlay_set    = true;
       g_defaults.overlay_enable = false;

@@ -5870,8 +5870,13 @@ static unsigned menu_displaylist_parse_playlists(
       const char *menu_ident = menu_driver_ident();
       bool show_add_content  = (settings->uints.menu_content_show_add_entry ==
             MENU_ADD_CONTENT_ENTRY_DISPLAY_PLAYLISTS_TAB);
+#ifdef RARCH_TV_LITE
+      /* TV Lite: netplay is never shown */
+      bool show_netplay      = false;
+#else
       bool show_netplay      = (settings->uints.menu_content_show_netplay ==
             MENU_ADD_CONTENT_ENTRY_DISPLAY_PLAYLISTS_TAB);
+#endif
       bool show_history      = !menu_history_in_main_menu(menu_ident, settings);
 
       if (show_history)
@@ -12096,6 +12101,7 @@ unsigned menu_displaylist_build_list(
 #ifdef HAVE_NFSCLIENT
                {MENU_ENUM_LABEL_NFS_CLIENT_SETTINGS,                PARSE_ACTION,      true},
 #endif
+#ifndef RARCH_TV_LITE
                {MENU_ENUM_LABEL_NETPLAY_PUBLIC_ANNOUNCE,            PARSE_ONLY_BOOL,   true},
                {MENU_ENUM_LABEL_NETPLAY_USE_MITM_SERVER,            PARSE_ONLY_BOOL,   true},
                {MENU_ENUM_LABEL_NETPLAY_MITM_SERVER,                PARSE_ONLY_STRING, false},
@@ -12121,6 +12127,7 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_NETPLAY_NAT_TRAVERSAL,              PARSE_ONLY_BOOL,   true},
                {MENU_ENUM_LABEL_NETPLAY_SHARE_DIGITAL,              PARSE_ONLY_UINT,   true},
                {MENU_ENUM_LABEL_NETPLAY_SHARE_ANALOG,               PARSE_ONLY_UINT,   true},
+#endif /* RARCH_TV_LITE */
             };
 
             for (i = 0; i < ARRAY_SIZE(build_list); i++)
@@ -12149,6 +12156,7 @@ unsigned menu_displaylist_build_list(
                   count++;
             }
 
+#ifndef RARCH_TV_LITE
             /* one entry for the sixteen Request Device switches */
             if (menu_entries_append(list,
                   msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NETPLAY_REQUEST_DEVICES),
@@ -12156,6 +12164,7 @@ unsigned menu_displaylist_build_list(
                   MENU_ENUM_LABEL_NETPLAY_REQUEST_DEVICES,
                   MENU_SETTING_ACTION, 0, 0, NULL))
                count++;
+#endif
 
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                   MENU_ENUM_LABEL_NETWORK_CMD_ENABLE,
@@ -13750,7 +13759,9 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_CONTENT_SHOW_IMAGES,                                   PARSE_ONLY_BOOL, true  },
                {MENU_ENUM_LABEL_CONTENT_SHOW_MUSIC,                                    PARSE_ONLY_BOOL, true  },
                {MENU_ENUM_LABEL_CONTENT_SHOW_VIDEO,                                    PARSE_ONLY_BOOL, true  },
+#ifndef RARCH_TV_LITE
                {MENU_ENUM_LABEL_CONTENT_SHOW_NETPLAY,                                  PARSE_ONLY_UINT, true  },
+#endif
                {MENU_ENUM_LABEL_CONTENT_SHOW_ADD_ENTRY,                                PARSE_ONLY_UINT, true  },
 #if defined(HAVE_DYNAMIC)
                {MENU_ENUM_LABEL_CONTENT_SHOW_CONTENTLESS_CORES,                        PARSE_ONLY_UINT, true  },
@@ -16085,12 +16096,15 @@ unsigned menu_displaylist_parse_online_updater(file_list_t *list,
       count++;
 #endif
 
+   /* TV Lite: thumbnails come in on demand, no manual updater */
+#ifndef RARCH_TV_LITE
    if (menu_entries_append(list,
             msg_hash_to_str(MENU_ENUM_LABEL_VALUE_PL_THUMBNAILS_UPDATER_LIST),
             MENU_ENUM_LABEL_PL_THUMBNAILS_UPDATER_LIST_STR,
             MENU_ENUM_LABEL_PL_THUMBNAILS_UPDATER_LIST,
             MENU_SETTING_ACTION, 0, 0, NULL))
       count++;
+#endif
 
 #ifdef HAVE_NETWORKING
    if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
@@ -18951,12 +18965,14 @@ static bool menu_displaylist_ctl_internal(
                      count++;
 
 #ifdef HAVE_NETWORKING
+#ifndef RARCH_TV_LITE
                if (settings->uints.menu_content_show_netplay
                      == MENU_ADD_CONTENT_ENTRY_DISPLAY_MAIN_TAB)
                   if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(info->list,
                            MENU_ENUM_LABEL_NETPLAY,
                            PARSE_ACTION, false) == 0)
                      count++;
+#endif /* RARCH_TV_LITE */
 
 #ifdef HAVE_ONLINE_UPDATER
                if (menu_displaylist_online_updater_shown(settings))

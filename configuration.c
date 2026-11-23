@@ -660,7 +660,10 @@ static const enum audio_resampler_driver_enum AUDIO_DEFAULT_RESAMPLER_DRIVER = A
 static const enum audio_resampler_driver_enum AUDIO_DEFAULT_RESAMPLER_DRIVER = AUDIO_RESAMPLER_SINC;
 #endif
 
-#if defined(HAVE_FFMPEG)
+#if defined(RARCH_TV_LITE)
+/* TV Lite: no recording or streaming */
+static const enum record_driver_enum RECORD_DEFAULT_DRIVER = RECORD_NULL;
+#elif defined(HAVE_FFMPEG)
 static const enum record_driver_enum RECORD_DEFAULT_DRIVER = RECORD_FFMPEG;
 #else
 static const enum record_driver_enum RECORD_DEFAULT_DRIVER = RECORD_WAV;

@@ -61,93 +61,16 @@ android {
     }
   }
 
+  // TV Lite: one 32-bit ARM build for Google TV / Android TV
   productFlavors {
-    normal {
-      resValue "string", "app_name", "RetroArch"
-      buildConfigField "boolean", "PLAY_STORE_BUILD", "false"
-
-      dimension "variant"
-    }
-    aarch64 {
-      applicationIdSuffix '.aarch64'
-      resValue "string", "app_name", "RetroArch (AArch64)"
+    tvlite {
+      applicationIdSuffix '.tvlite'
+      resValue "string", "app_name", "RetroArch TV Lite"
       buildConfigField "boolean", "PLAY_STORE_BUILD", "false"
 
       dimension "variant"
       ndk {
-        abiFilters 'arm64-v8a', 'x86_64'
-      }
-    }
-    ra32 {
-      applicationIdSuffix '.ra32'
-      resValue "string", "app_name", "RetroArch (32-bit)"
-      buildConfigField "boolean", "PLAY_STORE_BUILD", "false"
-
-      dimension "variant"
-      ndk {
-        abiFilters 'armeabi-v7a', 'x86'
-      }
-    }
-    playStoreNormal {
-      minSdkVersion 21
-      targetSdkVersion 36
-      versionCode getPlayStoreVersionCode()
-      versionName getPlayStoreVersionName()
-
-      resValue "string", "app_name", "RetroArch"
-      buildConfigField "boolean", "PLAY_STORE_BUILD", "true"
-
-      dimension "variant"
-
-      ndk {
-        abiFilters 'arm64-v8a', 'x86_64', 'armeabi-v7a'
-      }
-
-      externalNativeBuild {
-        ndkBuild {
-          arguments "-j${retroarchNativeJobs}", "PLAY_STORE_BUILD=1"
-        }
-      }
-    }
-    playStorePlus {
-      minSdkVersion 26
-      targetSdkVersion 36
-      versionCode getPlayStoreVersionCode()
-      versionName getPlayStoreVersionName()
-
-      applicationIdSuffix '.aarch64'
-      resValue "string", "app_name", "RetroArch Plus"
-      buildConfigField "boolean", "PLAY_STORE_BUILD", "true"
-
-      dimension "variant"
-
-      ndk {
-        abiFilters 'arm64-v8a', 'x86_64', 'armeabi-v7a'
-      }
-
-      externalNativeBuild {
-        ndkBuild {
-          arguments "-j${retroarchNativeJobs}", "PLAY_STORE_BUILD=1"
-        }
-      }
-    }
-    quest {
-      minSdkVersion 23
-      targetSdkVersion 34
-      applicationIdSuffix '.quest'
-      resValue "string", "app_name", "RetroArch XR"
-      buildConfigField "boolean", "PLAY_STORE_BUILD", "true"
-      buildConfigField "boolean", "META_QUEST_BUILD", "true"
-
-      dimension "variant"
-      ndk {
-        abiFilters 'arm64-v8a'
-      }
-
-      externalNativeBuild {
-        ndkBuild {
-          arguments "-j${retroarchNativeJobs}", "HAVE_OPENXR=1", "PLAY_STORE_BUILD=1", "META_QUEST_BUILD=1", "GLES=3"
-        }
+        abiFilters 'armeabi-v7a'
       }
     }
   }
@@ -167,23 +90,7 @@ android {
     release {
       manifest.srcFile 'src/release/AndroidManifest.xml'
     }
-    normal {
-      java.srcDirs += ['../play-core-stub']
-    }
-    aarch64 {
-      java.srcDirs += ['../play-core-stub']
-      res.srcDirs = ['res', 'res64']
-    }
-    ra32 {
-      java.srcDirs += ['../play-core-stub']
-    }
-    playStoreNormal {
-      java.srcDirs += ['../play-core-impl']
-    }
-    playStorePlus {
-      java.srcDirs += ['../play-core-impl']
-    }
-    quest {
+    tvlite {
       java.srcDirs += ['../play-core-stub']
     }
   }
@@ -216,25 +123,6 @@ android {
         signingConfig signingConfigs.debug
       }
     }
-  }
-}
-
-def playFeatureDelivery = 'com.google.android.play:feature-delivery:2.1.0'
-def playAssetDelivery = 'com.google.android.play:asset-delivery:2.2.2'
-
-dependencies {
-  playStoreNormalImplementation playFeatureDelivery
-  playStoreNormalImplementation playAssetDelivery
-  playStorePlusImplementation playFeatureDelivery
-  playStorePlusImplementation playAssetDelivery
-}
-
-dependencies {
-  constraints {
-    playStoreNormalImplementation 'androidx.activity:activity:1.10.1'
-    playStoreNormalImplementation 'androidx.fragment:fragment:1.8.6'
-    playStorePlusImplementation 'androidx.activity:activity:1.10.1'
-    playStorePlusImplementation 'androidx.fragment:fragment:1.8.6'
   }
 }
 

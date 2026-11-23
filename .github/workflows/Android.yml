@@ -48,6 +48,9 @@ jobs:
         distribution: 'temurin'
         cache: 'gradle'
 
+    - name: Bundle TV Lite assets (Ozone, fonts, sounds, controller profiles)
+      run: sh pkg/android/phoenix/tvlite-bundle-assets.sh
+
     - name: Compile RA
       run: |
         cd pkg/android/phoenix
@@ -69,25 +72,15 @@ jobs:
         done
         find . -iname "*.apk" -exec ls -l "{}" \;
 
-    - name: Verify 64-bit APK alignment
-      run: |
-        set -eu
-        for apk in pkg/android/phoenix/build/outputs/apk/{aarch64,quest}/debug/*.apk; do
-          python3 tools/android_elf_alignment.py "$apk"
-          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -c -P 16 4 "$apk"
-        done
-
     - name: Get short SHA
       id: slug
       run: echo "::set-output name=sha8::$(echo ${GITHUB_SHA} | cut -c1-8)"
 
     - uses: actions/upload-artifact@v4
       with:
-        name: retroarch-android-${{ steps.slug.outputs.sha8 }}
+        name: retroarch-tvlite-${{ steps.slug.outputs.sha8 }}
         path: |
-          pkg/android/phoenix/build/outputs/apk/normal/debug/phoenix-normal-debug.apk
-          pkg/android/phoenix/build/outputs/apk/aarch64/debug/phoenix-aarch64-debug.apk
-          pkg/android/phoenix/build/outputs/apk/quest/debug/phoenix-quest-debug.apk
+          pkg/android/phoenix/build/outputs/apk/tvlite/debug/phoenix-tvlite-debug.apk
 
   vp9-stack-abi:
     runs-on: ubuntu-latest
