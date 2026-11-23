@@ -3951,6 +3951,16 @@ static bool rarch_menu_init(
                CMD_EVENT_MENU_FIRST_RUN_DOWNLOAD);
    }
 #endif
+#if defined(RARCH_TV_LITE) && defined(HAVE_UPDATE_CORE_INFO) \
+   && defined(HAVE_ONLINE_UPDATER) && defined(HAVE_NETWORKING) \
+   && defined(HAVE_CONFIGFILE)
+   /* TV Lite: the core downloader names cores from their info files,
+    * and the bundled assets skip the first-run offer above, so fetch
+    * the info files whenever their folder is empty */
+   if (     !(p_dialog->first_run_downloads & MENU_FIRST_RUN_DL_CORE_INFO)
+         && menu_first_run_dir_missing(settings->paths.path_libretro_info))
+      action_ok_download_bundle(MENU_ENUM_LABEL_CB_UPDATE_CORE_INFO_FILES);
+#endif
 #endif
 
    return true;

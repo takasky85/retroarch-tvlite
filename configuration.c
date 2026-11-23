@@ -8159,6 +8159,13 @@ static bool config_load_file(const char *path, settings_t *settings)
    /* the binds, and the device settings read above */
    input_config_binds_changed();
 
+#ifdef RARCH_TV_LITE
+   /* TV Lite: the mouse always drives the menu and Quit is always on
+    * the main menu, also for configs saved by an earlier build */
+   settings->bools.menu_mouse_enable        = true;
+   settings->bools.menu_show_quit_retroarch = true;
+#endif
+
 #if defined(HAVE_MENU) && defined(HAVE_RGUI)
    if (!check_menu_driver_compatibility(settings))
       configuration_set_string(settings,

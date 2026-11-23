@@ -217,7 +217,7 @@
 #define DEFAULT_REBOOT_FORCE_SELF_ON_UPDATE true
 #endif
 
-#if (defined(_WIN32) && !defined(_XBOX)) || (defined(__linux) && !defined(ANDROID) && !defined(HAVE_LAKKA)) || (defined(__MACH__) && !TARGET_OS_IPHONE) || defined(__EMSCRIPTEN__)
+#if (defined(_WIN32) && !defined(_XBOX)) || (defined(__linux) && !defined(ANDROID) && !defined(HAVE_LAKKA)) || (defined(__MACH__) && !TARGET_OS_IPHONE) || defined(__EMSCRIPTEN__) || defined(RARCH_TV_LITE)
 #define DEFAULT_MOUSE_ENABLE true
 #else
 #define DEFAULT_MOUSE_ENABLE false
@@ -958,7 +958,7 @@
 #endif
 #define DEFAULT_MENU_SHOW_INFORMATION true
 #define DEFAULT_MENU_SHOW_CONFIGURATIONS true
-#if defined(ANDROID)
+#if defined(ANDROID) && !defined(RARCH_TV_LITE)
 /* Android's navigation model expects the user to leave via Home or the
  * task switcher rather than an in-app control, and the Android TV
  * guidelines state outright that an exit item should not appear in the

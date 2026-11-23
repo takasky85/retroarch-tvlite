@@ -40,6 +40,24 @@ Changed defaults:
 - Saves, states, system, playlists, thumbnails and the rest stay in
   `/storage/emulated/0/RetroArch`, as in stock RetroArch
 
+## Remote, mouse, keyboard and gamepads
+
+All of them work at once; use whichever is in your hand.
+
+| Remote button | In the menu | In a game |
+|---|---|---|
+| D-pad | Move | D-pad |
+| OK / Select | OK | RetroPad B (main button) |
+| Back | Back | Open the menu |
+| Channel Up | Start | Start |
+| Channel Down | Select | Select |
+
+The mouse drives the Ozone menu with its own cursor (always on in this
+build); in a game it goes to the core. Main Menu always has Quit.
+
+Missing core info files (the human-readable names in the core
+downloader) are fetched automatically whenever the info folder is empty.
+
 ## How the cores folder works
 
 Android will only load a core from the app's own private folder. Shared
