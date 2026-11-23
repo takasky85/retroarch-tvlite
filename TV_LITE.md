@@ -49,6 +49,9 @@ All of them work at once; use whichever is in your hand.
 | D-pad | Move | D-pad |
 | OK / Select | OK | RetroPad B (main button) |
 | Back | Back | Open the menu |
+
+Keyboard: Escape opens the menu (Android TV takes F1). Controller:
+L1+R1 opens the menu.
 | Channel Up | Start | Start |
 | Channel Down | Select | Select |
 
@@ -65,7 +68,10 @@ storage is mounted so nothing on it can run, and RetroArch also refuses
 any other location. So `/storage/emulated/0/RetroArch/cores` is where you
 put cores, and on every start RetroArch copies any new or changed `.so`
 file from there into its private cores folder, where it loads them from.
-Cores from the online core downloader go straight to the private folder.
+Cores from the online core downloader are installed in the private
+folder and copied to the cores folder too, so they survive an
+uninstall. Delete a core from Main Menu > Manage Cores, which removes
+both copies.
 
 A core you build yourself is not signed by libretro. Load it once from
 Main Menu > Load Core and choose "Always Trust"; after that it also loads

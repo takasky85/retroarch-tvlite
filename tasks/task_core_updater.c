@@ -1050,6 +1050,11 @@ void *task_push_get_core_updater_list(
 /* Download core */
 /*****************/
 
+#if defined(ANDROID) && defined(RARCH_TV_LITE)
+/* frontend/drivers/platform_unix.c */
+void android_tv_lite_export_cores(void);
+#endif
+
 static void cb_task_core_updater_download(
       retro_task_t *task, void *task_data,
       void *user_data, const char *err)
@@ -1091,6 +1096,10 @@ static void cb_task_core_updater_download(
 
    if (rescan)
    {
+#if defined(ANDROID) && defined(RARCH_TV_LITE)
+      if (!err)
+         android_tv_lite_export_cores();
+#endif
       command_event(CMD_EVENT_CORE_INFO_INIT, &refresh);
 #if defined(RARCH_INTERNAL) && defined(HAVE_MENU)
       /* Force reload of contentless cores icons */

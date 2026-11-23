@@ -37,6 +37,23 @@ jobs:
     - name: Bundle TV Lite assets (Ozone, fonts, sounds, controller profiles)
       run: sh pkg/android/phoenix/tvlite-bundle-assets.sh
 
+    - name: Signing key (one fixed key, so each build installs over the last)
+      env:
+        KEYSTORE_B64: ${{ secrets.TVLITE_KEYSTORE_B64 }}
+        KEYSTORE_PASSWORD: ${{ secrets.TVLITE_KEYSTORE_PASSWORD }}
+      run: |
+        if [ -n "$KEYSTORE_B64" ]; then
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/tvlite.jks"
+          {
+            echo "RELEASE_STORE_FILE=$RUNNER_TEMP/tvlite.jks"
+            echo "RELEASE_STORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "RELEASE_KEY_ALIAS=tvlite"
+            echo "RELEASE_KEY_PASSWORD=$KEYSTORE_PASSWORD"
+          } >> pkg/android/phoenix/gradle.properties
+        else
+          echo "::warning::No TVLITE_KEYSTORE_B64 secret: the APK is signed with a throwaway key and will not install over an earlier build"
+        fi
+
     - name: Compile RA
       run: |
         cd pkg/android/phoenix

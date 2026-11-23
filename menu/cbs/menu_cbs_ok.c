@@ -141,6 +141,11 @@
 
 #include "../../input/drivers_hid/winusb_bind.h"
 
+#if defined(ANDROID) && defined(RARCH_TV_LITE)
+/* frontend/drivers/platform_unix.c */
+void android_tv_lite_forget_core(const char *core_path);
+#endif
+
 enum
 {
    ACTION_OK_LOAD_PRESET = 0,
@@ -9816,6 +9821,9 @@ static int action_ok_core_delete(const char *path,
    else
 #endif
       filestream_delete(core_path);
+#if defined(ANDROID) && defined(RARCH_TV_LITE)
+   android_tv_lite_forget_core(core_path);
+#endif
 
    /* Reload core info files
     * > Forced: a core file changed on disk */

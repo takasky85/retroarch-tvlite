@@ -13810,7 +13810,12 @@ static void ozone_frame(void *data, video_frame_info_t *video_info)
    if (     (ozone->flags & OZONE_FLAG_SHOW_CURSOR)
          && (ozone->pointer.type != MENU_POINTER_DISABLED))
    {
+#ifdef RARCH_TV_LITE
+      /* TV Lite: Android is always full screen but does not say so */
+      bool cursor_visible = menu_mouse_enable;
+#else
       bool cursor_visible = (video_fullscreen || mouse_grabbed) && menu_mouse_enable;
+#endif
 
       gfx_display_set_alpha(ozone->pure_white, 1.0f);
       if (cursor_visible)

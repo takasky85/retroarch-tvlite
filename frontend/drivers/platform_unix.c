@@ -3039,6 +3039,11 @@ static size_t frontend_unix_get_os(char *s,
 
 #if defined(ANDROID) && defined(RARCH_TV_LITE)
 #include <sys/stat.h>
+#include <utime.h>
+
+/* <storage>/RetroArch/cores, or empty when shared storage is not
+ * writable */
+static char android_tv_lite_user_cores_dir[PATH_MAX_LENGTH];
 
 /* TV Lite: Android loads cores only from the app's own folder (shared
  * storage is mounted noexec, and android_core_path_resolve() refuses
@@ -3085,14 +3090,47 @@ static void android_tv_lite_import_cores(const char *src, const char *dst)
          continue;
 
       if (filestream_copy(src_path, dst_path) == 0)
+      {
+         /* Same time on both copies, so neither looks newer */
+         struct utimbuf times;
+         times.actime  = st_src.st_atime;
+         times.modtime = st_src.st_mtime;
+         utime(dst_path, &times);
          __android_log_print(ANDROID_LOG_INFO, "RetroArch",
-               "[TV Lite] Installed core \"%s\".\n", name);
+               "[TV Lite] Copied core \"%s\" to \"%s\".\n", name, dst);
+      }
       else
          __android_log_print(ANDROID_LOG_WARN, "RetroArch",
-               "[TV Lite] Could not install core \"%s\".\n", name);
+               "[TV Lite] Could not copy core \"%s\" to \"%s\".\n",
+               name, dst);
    }
 
    retro_closedir(dir);
+}
+
+/* After the core downloader installs a core: keep a copy in the
+ * user's cores folder, which an uninstall does not wipe, so a
+ * reinstall brings it back */
+void android_tv_lite_export_cores(void)
+{
+   android_tv_lite_import_cores(g_defaults.dirs[DEFAULT_DIR_CORE],
+         android_tv_lite_user_cores_dir);
+}
+
+/* A core deleted in the menu goes from the user's cores folder too,
+ * or the next start would bring it back */
+void android_tv_lite_forget_core(const char *core_path)
+{
+   char user_path[PATH_MAX_LENGTH];
+   const char *name = path_basename(core_path);
+
+   if (!*android_tv_lite_user_cores_dir || !name || !*name)
+      return;
+   fill_pathname_join_special(user_path, android_tv_lite_user_cores_dir,
+         name, sizeof(user_path));
+   if (     !string_is_equal(user_path, core_path)
+         && path_is_valid(user_path))
+      filestream_delete(user_path);
 }
 #endif
 
@@ -3613,13 +3651,14 @@ static void frontend_unix_get_env(int *argc,
              * is the app folder, which already holds both. */
             if (storage_permissions != INTERNAL_STORAGE_NOT_WRITABLE)
             {
-               char user_cores_dir[PATH_MAX_LENGTH];
+               char *user_cores_dir = android_tv_lite_user_cores_dir;
 
                fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CORE_INFO],
                      parent_path, "info",
                      sizeof(g_defaults.dirs[DEFAULT_DIR_CORE_INFO]));
                fill_pathname_join(user_cores_dir,
-                     parent_path, "cores", sizeof(user_cores_dir));
+                     parent_path, "cores",
+                     sizeof(android_tv_lite_user_cores_dir));
                if (!path_is_directory(g_defaults.dirs[DEFAULT_DIR_CORE_INFO]))
                   path_mkdir(g_defaults.dirs[DEFAULT_DIR_CORE_INFO]);
                if (!path_is_directory(user_cores_dir))

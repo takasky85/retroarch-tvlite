@@ -1230,7 +1230,12 @@ static const struct retro_keybind_def retro_keybinds_1[] = {
    },
    {
       AXIS_NONE, AXIS_NONE,
+#ifdef RARCH_TV_LITE
+      /* TV Lite: Android TV takes F1 for itself */
+      RETRO_KEYBIND_PACK(MENU_ENUM_LABEL_VALUE_INPUT_META_MENU_TOGGLE, RETROK_ESCAPE, true),
+#else
       RETRO_KEYBIND_PACK(MENU_ENUM_LABEL_VALUE_INPUT_META_MENU_TOGGLE, RETROK_F1, true),
+#endif
       RARCH_MENU_TOGGLE, NO_BTN, NO_BTN, 0
    },
 #ifdef HAVE_LAKKA
@@ -1242,7 +1247,12 @@ static const struct retro_keybind_def retro_keybinds_1[] = {
 #else
    {
       AXIS_NONE, AXIS_NONE,
+#ifdef RARCH_TV_LITE
+      /* TV Lite: Escape opens the menu; Quit is on the main menu */
+      RETRO_KEYBIND_PACK(MENU_ENUM_LABEL_VALUE_INPUT_META_QUIT_KEY, RETROK_UNKNOWN, true),
+#else
       RETRO_KEYBIND_PACK(MENU_ENUM_LABEL_VALUE_INPUT_META_QUIT_KEY, RETROK_ESCAPE, true),
+#endif
       RARCH_QUIT_KEY, NO_BTN, NO_BTN, 0
    },
 #endif

@@ -8164,6 +8164,20 @@ static bool config_load_file(const char *path, settings_t *settings)
     * the main menu, also for configs saved by an earlier build */
    settings->bools.menu_mouse_enable        = true;
    settings->bools.menu_show_quit_retroarch = true;
+   /* Controller: L1+R1 opens the menu unless another combo was chosen */
+   if (settings->uints.input_menu_toggle_gamepad_combo == INPUT_COMBO_NONE)
+      settings->uints.input_menu_toggle_gamepad_combo = INPUT_COMBO_L_R;
+   /* Keyboard: Android TV takes F1, so a saved F1 menu key becomes
+    * Escape, and Escape no longer quits */
+   {
+      struct retro_keybind *menu_key = &input_config_binds[0][RARCH_MENU_TOGGLE];
+      struct retro_keybind *quit_key = &input_config_binds[0][RARCH_QUIT_KEY];
+      if (RETRO_KEYBIND_KEY(menu_key) == RETROK_F1)
+         RETRO_KEYBIND_SET_KEY(menu_key, RETROK_ESCAPE);
+      if (     RETRO_KEYBIND_KEY(menu_key) == RETROK_ESCAPE
+            && RETRO_KEYBIND_KEY(quit_key) == RETROK_ESCAPE)
+         RETRO_KEYBIND_SET_KEY(quit_key, RETROK_UNKNOWN);
+   }
 #endif
 
 #if defined(HAVE_MENU) && defined(HAVE_RGUI)

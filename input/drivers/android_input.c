@@ -1479,6 +1479,17 @@ static INLINE void android_mouse_calculate_deltas(android_input_t *android,
       }
    }
 
+#ifdef RARCH_TV_LITE
+   /* TV Lite: an uncaptured mouse reports where the system pointer is;
+    * use that for the menu's cursor rather than summing deltas from
+    * the top left corner */
+   if ((source & AINPUT_SOURCE_MOUSE_RELATIVE) != AINPUT_SOURCE_MOUSE_RELATIVE)
+   {
+      x = android_input_event_x(ev, motion_ptr);
+      y = android_input_event_y(ev, motion_ptr);
+   }
+#endif
+
    /* a poll can apply several moves: the core reads their sum */
    VIDEO_POS_ADD(android->mouse_delta, x_delta, y_delta);
 
@@ -2038,7 +2049,7 @@ typedef char android_key_state_codes_check[
  *   swaps OK and Cancel by default) and the main button in games
  * - Channel Up is Enter, RetroPad Start
  * - Channel Down is Right Shift, RetroPad Select
- * - Back is F1, Menu Toggle, while a game runs, so the remote can
+ * - Back is Escape, Menu Toggle in this build, while a game runs, so the remote can
  *   always get back to the menu; in the menu it stays Back.
  * A mouse's right button arrives as BACK too and is left alone. The
  * keyboard's own keys are untouched, so a remote, a keyboard, a mouse
@@ -2070,7 +2081,7 @@ static int android_tv_lite_remote_key(int keycode, int source, int action)
 #else
                bool in_menu = false;
 #endif
-               back_as = in_menu ? AKEYCODE_BACK : AKEYCODE_F1;
+               back_as = in_menu ? AKEYCODE_BACK : AKEYCODE_ESCAPE;
             }
             return back_as;
          }
