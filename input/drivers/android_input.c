@@ -1496,9 +1496,13 @@ static INLINE void android_mouse_calculate_deltas(android_input_t *android,
 #ifdef RARCH_TV_LITE
    /* TV Lite: a captured mouse gives raw counts, without Android's
     * pointer speed, so the menu's cursor crawled across a TV. Move it
-    * twice as far; the core still gets the raw counts above. */
-   if (!x) x = VIDEO_POS_X(android->mouse_pos) + x_delta * 2.0f;
-   if (!y) y = VIDEO_POS_Y(android->mouse_pos) + y_delta * 2.0f;
+    * four times as far (it was still slow at 2x on a 4K TV); the core
+    * still gets the raw counts above. */
+   {
+      float speed = 4.0f;
+      if (!x) x = VIDEO_POS_X(android->mouse_pos) + x_delta * speed;
+      if (!y) y = VIDEO_POS_Y(android->mouse_pos) + y_delta * speed;
+   }
 #else
    if (!x) x = VIDEO_POS_X(android->mouse_pos) + x_delta;
    if (!y) y = VIDEO_POS_Y(android->mouse_pos) + y_delta;
