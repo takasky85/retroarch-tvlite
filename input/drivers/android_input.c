@@ -1493,8 +1493,16 @@ static INLINE void android_mouse_calculate_deltas(android_input_t *android,
    /* a poll can apply several moves: the core reads their sum */
    VIDEO_POS_ADD(android->mouse_delta, x_delta, y_delta);
 
+#ifdef RARCH_TV_LITE
+   /* TV Lite: a captured mouse gives raw counts, without Android's
+    * pointer speed, so the menu's cursor crawled across a TV. Move it
+    * twice as far; the core still gets the raw counts above. */
+   if (!x) x = VIDEO_POS_X(android->mouse_pos) + x_delta * 2.0f;
+   if (!y) y = VIDEO_POS_Y(android->mouse_pos) + y_delta * 2.0f;
+#else
    if (!x) x = VIDEO_POS_X(android->mouse_pos) + x_delta;
    if (!y) y = VIDEO_POS_Y(android->mouse_pos) + y_delta;
+#endif
 
    {
       input_driver_translate_coord_viewport_confined_wrap(&vp,
