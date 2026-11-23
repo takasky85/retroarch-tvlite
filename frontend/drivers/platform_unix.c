@@ -3040,6 +3040,7 @@ static size_t frontend_unix_get_os(char *s,
 #if defined(ANDROID) && defined(RARCH_TV_LITE)
 #include <sys/stat.h>
 #include <utime.h>
+#include <file/archive_file.h>
 
 /* <storage>/RetroArch/cores, or empty when shared storage is not
  * writable */
@@ -3103,6 +3104,95 @@ static void android_tv_lite_import_cores(const char *src, const char *dst)
          __android_log_print(ANDROID_LOG_WARN, "RetroArch",
                "[TV Lite] Could not copy core \"%s\" to \"%s\".\n",
                name, dst);
+   }
+
+   retro_closedir(dir);
+}
+
+/* TV Lite: a zip dropped in <storage>/RetroArch/cores is a core
+ * package.  Its .so files are unpacked into that same folder, where
+ * android_tv_lite_import_cores() picks them up, and its .info files
+ * into the core info folder.  A file is unpacked only when it is
+ * missing or older than the zip, and gets the zip's time, so the zip
+ * is not unpacked again on every start. */
+static void android_tv_lite_unpack_core_zips(const char *cores_dir,
+      const char *info_dir)
+{
+   struct RDIR *dir;
+
+   if (!*cores_dir || !path_is_directory(cores_dir))
+      return;
+   if (!(dir = retro_opendir(cores_dir)))
+      return;
+
+   while (retro_readdir(dir))
+   {
+      char zip_path[PATH_MAX_LENGTH];
+      struct stat st_zip;
+      struct string_list *list;
+      const char *name = retro_dirent_get_name(dir);
+      size_t i;
+
+      if (     !name
+            || retro_dirent_is_dir(dir, NULL)
+            || !string_is_equal_noncase(path_get_extension(name), "zip"))
+         continue;
+
+      fill_pathname_join_special(zip_path, cores_dir, name,
+            sizeof(zip_path));
+      if (stat(zip_path, &st_zip) != 0 || !S_ISREG(st_zip.st_mode))
+         continue;
+      if (!(list = file_archive_get_file_list(zip_path, "so|info")))
+         continue;
+
+      for (i = 0; i < list->size; i++)
+      {
+         char member[PATH_MAX_LENGTH];
+         char dst_path[PATH_MAX_LENGTH];
+         struct stat st_dst;
+         const char *entry = list->elems[i].data;
+         const char *base  = path_basename(entry);
+         const char *ext   = path_get_extension(entry);
+         const char *dst_dir;
+         void *buf         = NULL;
+         int64_t len       = 0;
+
+         if (!base || !*base)
+            continue;
+         if (string_is_equal_noncase(ext, "so"))
+            dst_dir = cores_dir;
+         else if (string_is_equal_noncase(ext, "info") && *info_dir)
+            dst_dir = info_dir;
+         else
+            continue;
+
+         fill_pathname_join_special(dst_path, dst_dir, base,
+               sizeof(dst_path));
+         if (     stat(dst_path, &st_dst) == 0
+               && st_dst.st_mtime >= st_zip.st_mtime)
+            continue;
+
+         snprintf(member, sizeof(member), "%s#%s", zip_path, entry);
+         if (     file_archive_compressed_read(member, &buf, NULL, &len)
+               && buf && len > 0
+               && filestream_write_file(dst_path, buf, len))
+         {
+            struct utimbuf times;
+            times.actime  = st_zip.st_atime;
+            times.modtime = st_zip.st_mtime;
+            utime(dst_path, &times);
+            __android_log_print(ANDROID_LOG_INFO, "RetroArch",
+                  "[TV Lite] Unpacked \"%s\" from \"%s\".\n",
+                  base, name);
+         }
+         else
+            __android_log_print(ANDROID_LOG_WARN, "RetroArch",
+                  "[TV Lite] Could not unpack \"%s\" from \"%s\".\n",
+                  entry, name);
+         free(buf);
+      }
+
+      string_list_free(list);
    }
 
    retro_closedir(dir);
@@ -3663,6 +3753,8 @@ static void frontend_unix_get_env(int *argc,
                   path_mkdir(g_defaults.dirs[DEFAULT_DIR_CORE_INFO]);
                if (!path_is_directory(user_cores_dir))
                   path_mkdir(user_cores_dir);
+               android_tv_lite_unpack_core_zips(user_cores_dir,
+                     g_defaults.dirs[DEFAULT_DIR_CORE_INFO]);
                android_tv_lite_import_cores(user_cores_dir,
                      g_defaults.dirs[DEFAULT_DIR_CORE]);
             }

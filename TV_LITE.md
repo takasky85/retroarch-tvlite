@@ -49,11 +49,11 @@ All of them work at once; use whichever is in your hand.
 | D-pad | Move | D-pad |
 | OK / Select | OK | RetroPad B (main button) |
 | Back | Back | Open the menu |
+| Channel Up | Start | Start |
+| Channel Down | Select | Select |
 
 Keyboard: Escape opens the menu (Android TV takes F1). Controller:
 L1+R1 opens the menu.
-| Channel Up | Start | Start |
-| Channel Down | Select | Select |
 
 The mouse drives the Ozone menu with its own cursor (always on in this
 build); in a game it goes to the core. Main Menu always has Quit.
@@ -72,6 +72,12 @@ Cores from the online core downloader are installed in the private
 folder and copied to the cores folder too, so they survive an
 uninstall. Delete a core from Main Menu > Manage Cores, which removes
 both copies.
+
+A core can also come as a zip: drop it in the cores folder and on the
+next start its `.so` is unpacked there (and installed as above) and its
+`.info` goes to the info folder. A zip is unpacked again only when it is
+newer than what it unpacked. Delete the zip too when you delete that
+core, or the next start installs it again.
 
 A core you build yourself is not signed by libretro. Load it once from
 Main Menu > Load Core and choose "Always Trust"; after that it also loads

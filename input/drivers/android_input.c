@@ -3722,16 +3722,36 @@ static int16_t android_input_state(
                case RETRO_DEVICE_ID_MOUSE_MIDDLE:
                   return android->mouse_m;
                case RETRO_DEVICE_ID_MOUSE_X:
+#ifdef RARCH_TV_LITE
+                  /* TV Lite: the menu reads this as a place in the
+                   * window, in pixels, as every other driver gives it.
+                   * The scaled -0x7fff..0x7fff lightgun value put the
+                   * menu's cursor off the screen, so the mouse seemed
+                   * not to move at all. */
+                  if (device == RARCH_DEVICE_MOUSE_SCREEN)
+                     return VIDEO_POS_X(android->mouse_pos);
+#else
                   if (device == RARCH_DEVICE_MOUSE_SCREEN)
                      return VIDEO_POS_X(android->mouse_viewport_screen_pos);
+#endif
 
                   val = VIDEO_POS_X(android->mouse_delta);
                   VIDEO_POS_PUT_X(android->mouse_delta, 0);
                   /* flush delta after it has been read */
                   return val;
                case RETRO_DEVICE_ID_MOUSE_Y:
+#ifdef RARCH_TV_LITE
+                  /* TV Lite: the menu reads this as a place in the
+                   * window, in pixels, as every other driver gives it.
+                   * The scaled -0x7fff..0x7fff lightgun value put the
+                   * menu's cursor off the screen, so the mouse seemed
+                   * not to move at all. */
+                  if (device == RARCH_DEVICE_MOUSE_SCREEN)
+                     return VIDEO_POS_Y(android->mouse_pos);
+#else
                   if (device == RARCH_DEVICE_MOUSE_SCREEN)
                      return VIDEO_POS_Y(android->mouse_viewport_screen_pos);
+#endif
 
                   val = VIDEO_POS_Y(android->mouse_delta);
                   VIDEO_POS_PUT_Y(android->mouse_delta, 0);
