@@ -5,9 +5,14 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Publish a GitHub release with this tag (for example v1.0); leave empty for a plain build'
+        required: false
+        default: ''
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
@@ -85,3 +90,13 @@ jobs:
         path: |
           pkg/android/phoenix/build/outputs/apk/tvlite/release/phoenix-tvlite-release.apk
 
+    - name: Publish release
+      if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ inputs.release_tag }}
+      run: |
+        apk="RetroArch-TV-Lite-$TAG.apk"
+        cp pkg/android/phoenix/build/outputs/apk/tvlite/release/phoenix-tvlite-release.apk "$apk"
+        gh release create "$TAG" "$apk" --target "$GITHUB_SHA" \
+          --title "RetroArch TV Lite $TAG" --notes-file TV_LITE.md
