@@ -1,0 +1,2510 @@
+/*  RetroArch - A frontend for libretro.
+ *  Copyright (C) 2010-2014 - Hans-Kristian Arntzen
+ *  Copyright (C) 2011-2017 - Daniel De Matteis
+ *
+ *  RetroArch is free software: you can redistribute it and/or modify it under the terms
+ *  of the GNU General Public License as published by the Free Software Found-
+ *  ation, either version 3 of the License, or (at your option) any later version.
+ *
+ *  RetroArch is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+ *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ *  PURPOSE.  See the GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License along with RetroArch.
+ *  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <stdlib.h>
+#include <string.h>
+
+#include <compat/strl.h>
+#include <compat/posix_string.h>
+#include <string/stdstring.h>
+
+#ifdef HAVE_CONFIG_H
+#include "../../config.h"
+#endif
+
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#include <gfx/gl_capabilities.h>
+#include "../common/gl2_common.h"
+#endif
+
+#include "shader_glsl.h"
+#include "glsl_rect.h"
+#include "glsl_colour.h"
+#include "../common/xmb_plastic.h"
+#include "../video_shader_parse.h"
+#ifdef HAVE_REWIND
+#include "../../state_manager.h"
+#endif
+#include "../../core.h"
+#include "../../retroarch.h"
+#include "../../verbosity.h"
+#include "../../input/input_driver.h"
+
+#if defined(ORBIS)
+#include <encodings/xxh64.h>
+#endif
+
+#if defined(VITA)
+#include <psp2/kernel/threadmgr/thread.h>
+#include <psp2/power.h>
+#endif
+
+#define PREV_TEXTURES (GFX_MAX_TEXTURES - 1)
+
+/* Cache the VBO. */
+struct cache_vbo
+{
+   GLuint vbo_primary;
+   GLuint vbo_secondary;
+   size_t len_primary;
+   size_t len_secondary;
+   GLfloat *buffer_primary;
+   GLfloat *buffer_secondary;
+};
+
+struct shader_program_glsl_data
+{
+   GLuint vprg;
+   GLuint fprg;
+
+   GLuint id;
+};
+
+struct glsl_attrib
+{
+   GLint loc;
+   GLsizei size;
+   GLsizei offset;
+};
+
+struct shader_uniforms_frame
+{
+   int texture;
+   int input_size;
+   int texture_size;
+   int tex_coord;
+};
+
+struct shader_uniforms
+{
+#if defined(VITA)
+   int time;
+#endif
+   int mvp;
+   int tex_coord;
+   int vertex_coord;
+   int color;
+   int lut_tex_coord;
+
+   int input_size;
+   int output_size;
+   int texture_size;
+   int final_vp_size;
+
+   int frame_count;
+   int swap_count;
+   int frame_direction;
+   int frame_time_delta;
+   float original_fps;
+   /* Use int for maximal compatibility despite other drivers using uint. */
+   int rotation;
+
+   float core_aspect;
+   float core_aspect_rot;
+
+   int gyroscope;
+   int accelerometer;
+   int accelerometer_rest;
+
+   int lut_texture[GFX_MAX_TEXTURES];
+   unsigned frame_count_mod;
+
+   struct shader_uniforms_frame orig;
+   struct shader_uniforms_frame feedback;
+   struct shader_uniforms_frame pass[GFX_MAX_SHADERS];
+   struct shader_uniforms_frame prev[PREV_TEXTURES];
+};
+
+static const char *glsl_prefixes[] = {
+   "",
+   "ruby",
+};
+
+#if defined(VITA)
+#include "../drivers/gl_cg_shaders/opaque.cg.vert.h"
+#include "../drivers/gl_cg_shaders/opaque.cg.frag.h"
+#include "../drivers/gl_cg_shaders/alpha_blend.cg.vert.h"
+#include "../drivers/gl_cg_shaders/alpha_blend.cg.frag.h"
+
+
+#else
+#include "../drivers/gl2_glsl_shaders/opaque.glsl.vert.h"
+#include "../drivers/gl2_glsl_shaders/opaque.glsl.frag.h"
+#include "../drivers/gl3_glsl_shaders/opaque.glsl.vert.h"
+#include "../drivers/gl3_glsl_shaders/opaque.glsl.frag.h"
+#include "../drivers/gl2_glsl_shaders/opaque_fixed_function.glsl.vert.h"
+#include "../drivers/gl2_glsl_shaders/opaque_fixed_function.glsl.frag.h"
+#include "../drivers/gl2_glsl_shaders/alpha_blend.glsl.vert.h"
+#include "../drivers/gl2_glsl_shaders/alpha_blend.glsl.frag.h"
+#include "../drivers/gl3_glsl_shaders/alpha_blend.glsl.vert.h"
+#include "../drivers/gl3_glsl_shaders/alpha_blend.glsl.frag.h"
+
+#endif
+
+/* A pass rewritten to read the frame where it lies (glsl_rect.h) */
+struct glsl_in_place_pass
+{
+   struct shader_program_glsl_data prg;
+   struct shader_uniforms uni;
+   /* RECT, CLAMP and TEXELS */
+   GLint loc[3];
+   /* Its program's index: 1 for the first pass */
+   unsigned idx;
+};
+
+/* The passes that read the frame - the first, and those reading the
+ * original - rewritten for the views of a hardware frame */
+struct glsl_in_place
+{
+   struct glsl_in_place_pass *pass;
+   unsigned count;
+   /* 1 + the glsl_rect_mode last tried, 0 none */
+   unsigned key;
+   enum glsl_rect_mode mode;
+   bool ok;
+   /* In prg[] and uniforms[], the passes' own here */
+   bool swapped;
+};
+
+typedef struct glsl_shader_data
+{
+   char alias_define[1024];
+   GLint attribs_elems[32 * PREV_TEXTURES + 2 + 4 + GFX_MAX_SHADERS];
+   unsigned attribs_index;
+   unsigned media_source_dims;
+   unsigned active_idx;
+   unsigned current_idx;
+   GLuint lut_textures[GFX_MAX_TEXTURES];
+   float  current_mat_data[VIDEO_SHADER_PROGRAM_COUNT];
+   float* current_mat_data_pointer[VIDEO_SHADER_PROGRAM_COUNT];
+   struct shader_uniforms uniforms[VIDEO_SHADER_PROGRAM_COUNT];
+   struct cache_vbo vbo[VIDEO_SHADER_PROGRAM_COUNT];
+   struct shader_program_glsl_data prg[VIDEO_SHADER_PROGRAM_COUNT];
+   struct video_shader *shader;
+   /* Staging for set_coords on draws of more than four vertices (font
+    * runs, the menu ribbon), grown on demand and kept for the shader's
+    * lifetime; it was malloc'd and freed on every such draw. */
+   GLfloat *coord_scratch;
+   size_t   coord_scratch_cap;
+   /* gfx_display meshes: made the first time one is drawn, and not
+    * tried again once it could not be */
+   GLuint mesh_prg;
+   GLint  mesh_mvp;
+   GLint  mesh_tint;
+   GLint  mesh_attr[3];
+   bool   mesh_failed;
+   uint8_t plastic_tried;
+   struct glsl_in_place in_place;
+   /* Private viewer programs, compiled while the preset is loaded. */
+   struct glsl_in_place viewer;
+   struct glsl_in_place_pass *viewer_pass[VIDEO_SHADER_PROGRAM_COUNT];
+   bool viewer_active;
+   /* Compiling something that may fail, with the copy to fall back on */
+   bool quiet;
+} glsl_shader_data_t;
+
+/* Select immutable program metadata by borrow, without swapping its arrays
+ * into the core chain for each viewer draw. */
+static const struct shader_program_glsl_data *gl_glsl_program(
+      const glsl_shader_data_t *glsl, unsigned index)
+{
+   const struct glsl_in_place_pass *pass = glsl->viewer_pass[index];
+   return glsl->viewer_active && pass ? &pass->prg : &glsl->prg[index];
+}
+
+static const struct shader_uniforms *gl_glsl_uniforms(
+      const glsl_shader_data_t *glsl, unsigned index)
+{
+   const struct glsl_in_place_pass *pass = glsl->viewer_pass[index];
+   return glsl->viewer_active && pass ? &pass->uni : &glsl->uniforms[index];
+}
+
+static void gl_glsl_in_place_free(glsl_shader_data_t *glsl);
+static void gl_glsl_viewer_prepare(glsl_shader_data_t *glsl);
+static void gl_glsl_viewer_free(glsl_shader_data_t *glsl);
+
+/* A gfx_display mesh vertex: three floats, then texture coordinates and
+ * colour as normalised integers the vertex fetch widens */
+static const char *stock_vertex_mesh_legacy = GLSL(
+   attribute vec3 VertexCoord;
+   attribute vec2 TexCoord;
+   attribute vec4 Color;
+   uniform mat4 MVPMatrix;
+   uniform vec4 Tint;
+   varying vec2 tex_coord;
+   varying vec4 color;
+
+   void main() {
+      gl_Position = MVPMatrix * vec4(VertexCoord, 1.0);
+      tex_coord   = TexCoord;
+      color       = Color * Tint;
+   }
+);
+
+static const char *stock_fragment_mesh_legacy = GLSL(
+   uniform sampler2D Texture;
+   varying vec2 tex_coord;
+   varying vec4 color;
+
+   void main() {
+      gl_FragColor = color * texture2D(Texture, tex_coord);
+   }
+);
+
+static const char *stock_vertex_mesh_core = GLSL(
+   in vec3 VertexCoord;
+   in vec2 TexCoord;
+   in vec4 Color;
+   uniform mat4 MVPMatrix;
+   uniform vec4 Tint;
+   out vec2 tex_coord;
+   out vec4 color;
+
+   void main() {
+      gl_Position = MVPMatrix * vec4(VertexCoord, 1.0);
+      tex_coord   = TexCoord;
+      color       = Color * Tint;
+   }
+);
+
+static const char *stock_fragment_mesh_core = GLSL(
+   uniform sampler2D Texture;
+   in vec2 tex_coord;
+   in vec4 color;
+   out vec4 FragColor;
+
+   void main() {
+      FragColor = color * texture(Texture, tex_coord);
+   }
+);
+
+/* TODO/FIXME - static globals */
+static bool glsl_core;
+static bool glsl_viewer_hdr;
+static unsigned glsl_major;
+static unsigned glsl_minor;
+
+static GLint gl_glsl_get_uniform(glsl_shader_data_t *glsl,
+      GLuint prog, const char *base)
+{
+   unsigned i;
+   GLint loc;
+   char buf[80];
+   size_t _len = strlcpy(buf, glsl->shader->prefix, sizeof(buf));
+   strlcpy(buf + _len, base, sizeof(buf) - _len);
+   if ((loc = glGetUniformLocation(prog, buf)) >= 0)
+      return loc;
+
+   for (i = 0; i < ARRAY_SIZE(glsl_prefixes); i++)
+   {
+      buf[0] = '\0';
+      _len = strlcpy(buf, glsl_prefixes[i], sizeof(buf));
+      strlcpy(buf + _len, base, sizeof(buf) - _len);
+      if ((loc = glGetUniformLocation(prog, buf)) >= 0)
+         return loc;
+   }
+
+   return -1;
+}
+
+static GLint gl_glsl_get_attrib(glsl_shader_data_t *glsl,
+      GLuint prog, const char *base)
+{
+   unsigned i;
+   GLint loc;
+   char buf[80];
+   size_t _len = strlcpy(buf, glsl->shader->prefix, sizeof(buf));
+   strlcpy(buf + _len, base, sizeof(buf) - _len);
+   if ((loc = glGetUniformLocation(prog, buf)) >= 0)
+      return loc;
+
+   for (i = 0; i < ARRAY_SIZE(glsl_prefixes); i++)
+   {
+      _len = strlcpy(buf, glsl_prefixes[i], sizeof(buf));
+      strlcpy(buf + _len, base, sizeof(buf) - _len);
+      if ((loc = glGetAttribLocation(prog, buf)) >= 0)
+         return loc;
+   }
+
+   return -1;
+}
+
+static void gl_glsl_print_shader_log(GLuint obj)
+{
+   char *info_log = NULL;
+   GLint max_len, info_len = 0;
+
+   glGetShaderiv(obj, GL_INFO_LOG_LENGTH, &max_len);
+
+   if (max_len == 0)
+      return;
+
+   info_log = (char*)malloc(max_len);
+   if (!info_log)
+      return;
+
+   glGetShaderInfoLog(obj, max_len, &info_len, info_log);
+
+   if (info_len > 0)
+      RARCH_LOG("[GLSL] Shader log: %s.\n", info_log);
+
+   free(info_log);
+}
+
+static void gl_glsl_print_linker_log(GLuint obj)
+{
+   char *info_log = NULL;
+   GLint max_len, info_len = 0;
+
+   glGetProgramiv(obj, GL_INFO_LOG_LENGTH, &max_len);
+
+   if (max_len == 0)
+      return;
+
+   info_log = (char*)malloc(max_len);
+   if (!info_log)
+      return;
+
+   glGetProgramInfoLog(obj, max_len, &info_len, info_log);
+
+   if (info_len > 0)
+      RARCH_LOG("[GLSL] Linker log: %s.\n", info_log);
+
+   free(info_log);
+}
+
+#if defined(ORBIS)
+static uint64_t gl_glsl_hash_shader(
+      const char **source, const int source_length)
+{
+   int           n;
+   xxh64_state_t state;
+
+   xxh64_reset(&state, 0xAABBCCDDu);
+   for (n = 0; n < source_length; n++)
+      xxh64_update(&state, source[n], strlen(source[n]));
+   return xxh64_digest(&state);
+}
+
+/* The shader binary stored under @hash, if there is one */
+static bool gl_glsl_load_binary_shader(GLuint shader, uint64_t hash)
+{
+   GLint status;
+   char key[32];
+   video_shader_cache_view_t view;
+
+   snprintf(key, sizeof(key), "%lx", (unsigned long)hash);
+   if (!video_shader_cache_map(VIDEO_SHADER_CACHE_ORBIS_BINARY, key, &view))
+      return false;
+   if (view.len > 0x7fffffff)
+   {
+      video_shader_cache_unmap(&view);
+      return false;
+   }
+   glShaderBinary(1, &shader, 2, view.data, (GLsizei)view.len);
+   video_shader_cache_unmap(&view);
+   glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+   return status == GL_TRUE;
+}
+#endif
+
+static bool gl_glsl_compile_shader(glsl_shader_data_t *glsl,
+      GLuint shader,
+      const char *define, const char *program)
+{
+   GLint status;
+   const char *source[4];
+   char version[32];
+   const char *existing_version = strstr(program, "#version");
+
+   version[0]                   = '\0';
+
+   if (existing_version)
+   {
+      const char* version_extra = "";
+      unsigned version_no       = (unsigned)
+         strtoul(existing_version + 8, (char**)&program, 10);
+
+#ifdef HAVE_OPENGLES
+      if (gl_check_capability(GL_CAPS_GLES3_SUPPORTED))
+      {
+         if (version_no >= 130 && version_no < 330)
+         {
+            version_extra = " es";
+            version_no    = 300;
+         }
+         else if (version_no == 330)
+         {
+            version_extra = " es";
+            version_no    = 310;
+         }
+         else if (version_no > 330)
+         {
+            version_extra = " es";
+            version_no    = 320;
+         }
+         else version_no  = 100;
+      }
+      /* Avoid versions that definitely aren't supported. */
+      else version_no     = 100;
+#endif
+      snprintf(version,
+            sizeof(version), "#version %u%s\n", version_no, version_extra);
+      RARCH_LOG("[GLSL] Using GLSL version %u%s.\n", version_no, version_extra);
+   }
+   else if (glsl_core)
+   {
+      unsigned version_no = 0;
+#ifdef HAVE_OPENGLES
+      /* glsl_core (the glcore/gl3 driver) uses modern in/out stock
+       * shaders.  On GLES a desktop "#version 130" is rejected outright
+       * ("GLSL 1.30 is not supported"), which broke every GLSL shader on
+       * the glcore driver; emit an "... es" version instead, mirroring
+       * the user-shader mapping above. */
+      if (gl_check_capability(GL_CAPS_GLES3_SUPPORTED))
+      {
+         unsigned gl_ver = glsl_major * 100 + glsl_minor * 10;
+         if      (gl_ver >= 320)
+            version_no = 320;
+         else if (gl_ver >= 310)
+            version_no = 310;
+         else
+            version_no = 300;
+         snprintf(version, sizeof(version), "#version %u es\n", version_no);
+         RARCH_LOG("[GLSL] Using GLSL version %u es.\n", version_no);
+      }
+      else
+      {
+         snprintf(version, sizeof(version), "#version 100\n");
+         RARCH_LOG("[GLSL] Using GLSL version 100.\n");
+      }
+#else
+      unsigned gl_ver     = glsl_major * 100 + glsl_minor * 10;
+
+      if (gl_ver >= 300)
+         version_no = 130;
+      else if (gl_ver >= 210)
+         version_no = 120;
+      else
+         version_no = 110;
+
+      snprintf(version, sizeof(version), "#version %u\n", version_no);
+      RARCH_LOG("[GLSL] Using GLSL version %u.\n", version_no);
+#endif
+   }
+
+   source[0] = version;
+   source[1] = define;
+   source[2] = glsl->alias_define;
+   source[3] = program;
+
+#if defined(ORBIS)
+   if (gl_glsl_load_binary_shader(shader,
+            gl_glsl_hash_shader(source, ARRAY_SIZE(source))))
+      return true;
+#endif
+
+   glShaderSource(shader, ARRAY_SIZE(source), source, NULL);
+   glCompileShader(shader);
+
+   glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+   if (!glsl->quiet)
+      gl_glsl_print_shader_log(shader);
+
+   return status == GL_TRUE;
+}
+
+static bool gl_glsl_link_program(GLuint prog, bool quiet)
+{
+   GLint status;
+
+   glLinkProgram(prog);
+
+   glGetProgramiv(prog, GL_LINK_STATUS, &status);
+   if (!quiet)
+      gl_glsl_print_linker_log(prog);
+
+   if (status != GL_TRUE)
+      return false;
+
+   glUseProgram(prog);
+   return true;
+}
+
+static bool gl_glsl_compile_program(
+      void *data,
+      unsigned idx,
+      void *program_data,
+      struct shader_program_info *program_info)
+{
+   glsl_shader_data_t                 *glsl = (glsl_shader_data_t*)data;
+   struct shader_program_glsl_data *program =
+      (struct shader_program_glsl_data*)program_data;
+   GLuint prog                              = glCreateProgram();
+
+   if (!program)
+      program = &glsl->prg[idx];
+
+   if (!prog)
+      goto error;
+
+   if (program_info->vertex)
+   {
+      RARCH_LOG("[GLSL] Found GLSL vertex shader.\n");
+      program->vprg = glCreateShader(GL_VERTEX_SHADER);
+
+      if (!gl_glsl_compile_shader(
+               glsl,
+               program->vprg,
+               "#define VERTEX\n#define PARAMETER_UNIFORM\n#define _HAS_ORIGINALASPECT_UNIFORMS\n#define _HAS_FRAMETIME_UNIFORMS\n#define _HAS_SENSOR_UNIFORMS\n#define _HAS_SWAPCOUNT_UNIFORM\n",
+               program_info->vertex))
+      {
+         if (!glsl->quiet)
+            RARCH_ERR("[GLSL] Failed to compile vertex shader #%u.\n", idx);
+         goto error;
+      }
+
+      glAttachShader(prog, program->vprg);
+   }
+
+   if (program_info->fragment)
+   {
+      RARCH_LOG("[GLSL] Found GLSL fragment shader.\n");
+      program->fprg = glCreateShader(GL_FRAGMENT_SHADER);
+      if (!gl_glsl_compile_shader(glsl, program->fprg,
+               "#define FRAGMENT\n#define PARAMETER_UNIFORM\n#define _HAS_ORIGINALASPECT_UNIFORMS\n#define _HAS_FRAMETIME_UNIFORMS\n#define _HAS_SENSOR_UNIFORMS\n#define _HAS_SWAPCOUNT_UNIFORM\n",
+               program_info->fragment))
+      {
+         if (!glsl->quiet)
+            RARCH_ERR("[GLSL] Failed to compile fragment shader #%u.\n", idx);
+         goto error;
+      }
+
+      glAttachShader(prog, program->fprg);
+   }
+
+   if (program_info->vertex || program_info->fragment)
+   {
+      RARCH_LOG("[GLSL] Linking GLSL program.\n");
+      if (!gl_glsl_link_program(prog, glsl->quiet))
+         goto error;
+
+      /* Clean up dead memory. We're not going to relink the program.
+       * Detaching first seems to kill some mobile drivers
+       * (according to the intertubes anyways). */
+      if (program->vprg)
+         glDeleteShader(program->vprg);
+      if (program->fprg)
+         glDeleteShader(program->fprg);
+      program->vprg = 0;
+      program->fprg = 0;
+
+      glUseProgram(prog);
+#if defined(VITA)
+      glUniform1i(gl_glsl_get_uniform(glsl, prog, "vTexture"), 0);
+#else
+      glUniform1i(gl_glsl_get_uniform(glsl, prog, "Texture"), 0);
+#endif
+      glUseProgram(0);
+   }
+
+   program->id = prog;
+
+   return true;
+
+error:
+   if (!glsl->quiet)
+      RARCH_ERR("[GLSL] Failed to link program #%u.\n", idx);
+   if (prog)
+      glDeleteProgram(prog);
+   if (program->vprg)
+      glDeleteShader(program->vprg);
+   if (program->fprg)
+      glDeleteShader(program->fprg);
+   program->vprg = 0;
+   program->fprg = 0;
+   program->id   = 0;
+   return false;
+}
+
+static void gl_glsl_strip_parameter_pragmas(char *source, const char *str)
+{
+   /* #pragma parameter lines tend to have " characters in them,
+    * which is not legal GLSL. */
+   char *s = strstr(source, str);
+
+   while (s)
+   {
+      /* #pragmas have to be on a single line,
+       * so we can just replace the entire line with spaces. */
+      while (*s != '\0' && *s != '\n')
+         *s++ = ' ';
+      s = strstr(s, str);
+   }
+}
+
+static bool gl_glsl_load_source_path(struct video_shader_pass *pass,
+      const char *path)
+{
+   int64_t len = 0;
+
+   /* Asked for by name: this driver does not open it. What comes back
+    * is ours to free, as before. */
+   if (     !pass
+         || !video_shader_source_read(path,
+               &pass->source.string.vertex, &len)
+         || len <= 0)
+      return false;
+
+   gl_glsl_strip_parameter_pragmas(pass->source.string.vertex,
+         "#pragma parameter");
+   pass->source.string.fragment = strdup(pass->source.string.vertex);
+   return pass->source.string.fragment && pass->source.string.vertex;
+}
+
+static bool gl_glsl_compile_programs(
+      glsl_shader_data_t *glsl,
+      struct shader_program_glsl_data *program)
+{
+   unsigned i;
+
+   for (i = 0; i < glsl->shader->passes; i++)
+   {
+      struct shader_program_info shader_prog_info;
+      const char *vertex           = NULL;
+      const char *fragment         = NULL;
+      struct video_shader_pass *pass = (struct video_shader_pass*)
+         &glsl->shader->pass[i];
+
+      if (!pass)
+         continue;
+
+      /* If we load from GLSLP (preset),
+       * load the file here.
+       */
+      if (     *pass->source.path
+            && !gl_glsl_load_source_path(pass, pass->source.path))
+      {
+         RARCH_ERR("[GLSL] Failed to load GLSL shader: %s.\n",
+               pass->source.path);
+         return false;
+      }
+
+      vertex                    = pass->source.string.vertex;
+      fragment                  = pass->source.string.fragment;
+
+      shader_prog_info.vertex   = vertex;
+      shader_prog_info.fragment = fragment;
+      shader_prog_info.is_file  = false;
+
+      if (!gl_glsl_compile_program(glsl, i,
+            &program[i],
+            &shader_prog_info))
+      {
+         RARCH_ERR("[GLSL] Failed to create GL program #%u.\n", i);
+         return false;
+      }
+   }
+
+   return true;
+}
+
+static void gl_glsl_reset_attrib(glsl_shader_data_t *glsl)
+{
+   unsigned i;
+   for (i = 0; i < glsl->attribs_index; i++)
+      glDisableVertexAttribArray(glsl->attribs_elems[i]);
+   glsl->attribs_index = 0;
+}
+
+/* Coords change from one draw to the next (each font flush, each menu
+ * quad), so the buffer is re-specified many times a frame: GL_STREAM_DRAW
+ * says so, and lets the driver keep it where the CPU writes it cheaply. */
+static void gl_glsl_set_vbo(GLfloat **buffer, size_t *buffer_elems,
+      const GLfloat *data, size_t elems)
+{
+   if (elems > *buffer_elems)
+   {
+      GLfloat *new_buffer = (GLfloat*)
+         realloc(*buffer, elems * sizeof(GLfloat));
+
+      /* The buffer is only a copy of what was last uploaded, so that an
+       * identical set of coords can skip the upload next time. Upload
+       * straight from the caller's data and leave the existing
+       * allocation - realloc keeps it on failure - marked empty, so the
+       * comparison in gl_glsl_set_attribs cannot read it and the next
+       * call retries the grow. */
+      if (!new_buffer)
+      {
+         glBufferData(GL_ARRAY_BUFFER, elems * sizeof(GLfloat),
+               data, GL_STREAM_DRAW);
+         *buffer_elems = 0;
+         return;
+      }
+
+      *buffer             = new_buffer;
+   }
+
+   memcpy(*buffer, data, elems * sizeof(GLfloat));
+   glBufferData(GL_ARRAY_BUFFER, elems * sizeof(GLfloat),
+         data, GL_STREAM_DRAW);
+   *buffer_elems = elems;
+}
+
+static INLINE void gl_glsl_set_attribs(glsl_shader_data_t *glsl,
+      GLuint vbo,
+      GLfloat **buffer, size_t *buffer_elems,
+      const GLfloat *data, size_t elems,
+      const struct glsl_attrib *attrs, size_t num_attrs)
+{
+   size_t i;
+
+   glBindBuffer(GL_ARRAY_BUFFER, vbo);
+
+   if (elems != *buffer_elems ||
+         memcmp(data, *buffer, elems * sizeof(GLfloat)))
+      gl_glsl_set_vbo(buffer, buffer_elems, data, elems);
+
+   for (i = 0; i < num_attrs; i++)
+   {
+      if (glsl->attribs_index < ARRAY_SIZE(glsl->attribs_elems))
+      {
+         GLint loc = attrs[i].loc;
+
+         glEnableVertexAttribArray(loc);
+         glVertexAttribPointer(loc, attrs[i].size, GL_FLOAT, GL_FALSE, 0,
+               (const GLvoid*)(uintptr_t)attrs[i].offset);
+         glsl->attribs_elems[glsl->attribs_index++] = loc;
+      }
+      else
+         RARCH_WARN("[GLSL] Attrib array buffer was overflown.\n");
+   }
+
+   glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+static void gl_glsl_clear_uniforms_frame(
+      struct shader_uniforms_frame *frame)
+{
+   frame->texture      = -1;
+   frame->texture_size = -1;
+   frame->input_size   = -1;
+   frame->tex_coord    = -1;
+}
+
+static void gl_glsl_find_uniforms_frame(glsl_shader_data_t *glsl,
+      GLuint prog,
+      struct shader_uniforms_frame *frame, const char *base)
+{
+   char uni[64];
+   size_t _len = strlcpy(uni, base, sizeof(uni));
+
+   if (frame->texture < 0)
+   {
+      strlcpy_lit(uni + _len, "Texture", sizeof(uni) - _len);
+      frame->texture = gl_glsl_get_uniform(glsl, prog, uni);
+   }
+
+   if (frame->tex_coord < 0)
+   {
+      strlcpy_lit(uni + _len, "TexCoord", sizeof(uni) - _len);
+      frame->tex_coord = gl_glsl_get_attrib(glsl, prog, uni);
+   }
+
+   if (frame->input_size < 0)
+   {
+      strlcpy_lit(uni + _len, "InputSize",   sizeof(uni) - _len);
+      frame->input_size = gl_glsl_get_uniform(glsl, prog, uni);
+   }
+
+   if (frame->texture_size < 0)
+   {
+      strlcpy_lit(uni + _len, "TextureSize", sizeof(uni) - _len);
+      frame->texture_size = gl_glsl_get_uniform(glsl, prog, uni);
+   }
+
+}
+
+static void gl_glsl_find_uniforms(glsl_shader_data_t *glsl,
+      unsigned pass, GLuint prog,
+      struct shader_uniforms *uni)
+{
+   unsigned i;
+   char frame_base[64];
+
+   frame_base[0] = '\0';
+
+   glUseProgram(prog);
+
+#if defined(VITA)
+   uni->time             = gl_glsl_get_uniform(glsl, prog, "Time");
+#endif
+
+   uni->mvp              = gl_glsl_get_uniform(glsl, prog, "MVPMatrix");
+   uni->tex_coord        = gl_glsl_get_attrib(glsl, prog, "TexCoord");
+   uni->vertex_coord     = gl_glsl_get_attrib(glsl, prog, "VertexCoord");
+   uni->color            = gl_glsl_get_attrib(glsl, prog, "Color");
+   uni->lut_tex_coord    = gl_glsl_get_attrib(glsl, prog, "LUTTexCoord");
+
+   uni->input_size       = gl_glsl_get_uniform(glsl, prog, "InputSize");
+   uni->output_size      = gl_glsl_get_uniform(glsl, prog, "OutputSize");
+   uni->texture_size     = gl_glsl_get_uniform(glsl, prog, "TextureSize");
+   uni->final_vp_size    = gl_glsl_get_uniform(glsl, prog, "FinalViewportSize");
+
+   uni->frame_count      = gl_glsl_get_uniform(glsl, prog, "FrameCount");
+   uni->swap_count       = gl_glsl_get_uniform(glsl, prog, "SwapCount");
+   uni->frame_direction  = gl_glsl_get_uniform(glsl, prog, "FrameDirection");
+   uni->frame_time_delta = gl_glsl_get_uniform(glsl, prog, "FrameTimeDelta");
+   uni->original_fps         = gl_glsl_get_uniform(glsl, prog, "OriginalFPS");
+   uni->rotation         = gl_glsl_get_uniform(glsl, prog, "Rotation");
+   uni->core_aspect      = gl_glsl_get_uniform(glsl, prog, "OriginalAspect");
+   uni->core_aspect_rot  = gl_glsl_get_uniform(glsl, prog, "OriginalAspectRotated");
+
+   uni->gyroscope             = gl_glsl_get_uniform(glsl, prog, "Gyroscope");
+   uni->accelerometer         = gl_glsl_get_uniform(glsl, prog, "Accelerometer");
+   uni->accelerometer_rest    = gl_glsl_get_uniform(glsl, prog, "AccelerometerRest");
+
+   if (  uni->gyroscope >= 0
+      || uni->accelerometer >= 0
+      || uni->accelerometer_rest >= 0)
+      input_driver_set_shader_uses_sensors(true);
+
+   for (i = 0; i < glsl->shader->luts; i++)
+      uni->lut_texture[i] = glGetUniformLocation(prog, glsl->shader->lut[i].id);
+
+   gl_glsl_clear_uniforms_frame(&uni->orig);
+   gl_glsl_find_uniforms_frame(glsl, prog, &uni->orig, "Orig");
+   gl_glsl_clear_uniforms_frame(&uni->feedback);
+   gl_glsl_find_uniforms_frame(glsl, prog, &uni->feedback, "Feedback");
+
+   if (pass > 1)
+   {
+      snprintf(frame_base, sizeof(frame_base), "PassPrev%u", pass);
+      gl_glsl_find_uniforms_frame(glsl, prog, &uni->orig, frame_base);
+   }
+
+   for (i = 0; i + 1 < pass; i++)
+   {
+      snprintf(frame_base, sizeof(frame_base), "Pass%u", i + 1);
+      gl_glsl_clear_uniforms_frame(&uni->pass[i]);
+      gl_glsl_find_uniforms_frame(glsl, prog, &uni->pass[i], frame_base);
+      snprintf(frame_base, sizeof(frame_base), "PassPrev%u", pass - (i + 1));
+      gl_glsl_find_uniforms_frame(glsl, prog, &uni->pass[i], frame_base);
+
+      if (*glsl->shader->pass[i].alias)
+         gl_glsl_find_uniforms_frame(glsl, prog, &uni->pass[i], glsl->shader->pass[i].alias);
+   }
+
+   gl_glsl_clear_uniforms_frame(&uni->prev[0]);
+   gl_glsl_find_uniforms_frame(glsl, prog, &uni->prev[0], "Prev");
+   for (i = 1; i < PREV_TEXTURES; i++)
+   {
+      snprintf(frame_base, sizeof(frame_base), "Prev%u", i);
+      gl_glsl_clear_uniforms_frame(&uni->prev[i]);
+      gl_glsl_find_uniforms_frame(glsl, prog, &uni->prev[i], frame_base);
+   }
+
+   glUseProgram(0);
+}
+
+static void gl_glsl_deinit_shader(glsl_shader_data_t *glsl)
+{
+   unsigned i;
+
+   if (!glsl || !glsl->shader)
+      return;
+
+   for (i = 0; i < glsl->shader->passes; i++)
+   {
+      free(glsl->shader->pass[i].source.string.vertex);
+      free(glsl->shader->pass[i].source.string.fragment);
+   }
+
+   free(glsl->shader);
+   glsl->shader = NULL;
+}
+
+static void gl_glsl_destroy_resources(glsl_shader_data_t *glsl)
+{
+   unsigned i;
+
+   if (!glsl)
+      return;
+
+   glsl->current_idx = 0;
+
+   glUseProgram(0);
+
+   if (glsl->mesh_prg)
+      glDeleteProgram(glsl->mesh_prg);
+   glsl->mesh_prg    = 0;
+   glsl->mesh_failed = false;
+
+   for (i = 0; i < VIDEO_SHADER_PROGRAM_COUNT; i++)
+   {
+      if (glsl->prg[i].id == 0 || (i && glsl->prg[i].id == glsl->prg[0].id))
+         continue;
+      if (!glIsProgram(glsl->prg[i].id))
+         continue;
+
+      glDeleteProgram(glsl->prg[i].id);
+      glsl->prg[i].id = 0;
+   }
+
+   if (glsl->shader && glsl->shader->luts)
+      glDeleteTextures(glsl->shader->luts, glsl->lut_textures);
+
+   /* The rewritten passes, or the passes themselves while those are
+    * swapped in */
+   gl_glsl_in_place_free(glsl);
+   gl_glsl_viewer_free(glsl);
+
+   memset(glsl->prg, 0, sizeof(glsl->prg));
+   memset(glsl->uniforms, 0, sizeof(glsl->uniforms));
+   glsl->active_idx         = 0;
+   glsl->plastic_tried      = false;
+
+   gl_glsl_deinit_shader(glsl);
+
+   gl_glsl_reset_attrib(glsl);
+
+   for (i = 0; i < VIDEO_SHADER_PROGRAM_COUNT; i++)
+   {
+      if (glsl->vbo[i].vbo_primary)
+         glDeleteBuffers(1, &glsl->vbo[i].vbo_primary);
+      if (glsl->vbo[i].vbo_secondary)
+         glDeleteBuffers(1, &glsl->vbo[i].vbo_secondary);
+
+      free(glsl->vbo[i].buffer_primary);
+      free(glsl->vbo[i].buffer_secondary);
+   }
+   memset(&glsl->vbo, 0, sizeof(glsl->vbo));
+}
+
+static void gl_glsl_deinit(void *data)
+{
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)data;
+
+   if (!glsl)
+      return;
+
+   gl_glsl_destroy_resources(glsl);
+   input_driver_set_shader_uses_sensors(false);
+
+   free(glsl->coord_scratch);
+   free(glsl);
+}
+
+
+static void *gl_glsl_init(void *data, const char *path)
+{
+   unsigned i;
+   struct shader_program_info shader_prog_info;
+   bool shader_support        = false;
+#ifdef GLSL_DEBUG
+   char *err_string           = NULL;
+#endif
+   const char *stock_vertex   = NULL;
+   const char *stock_fragment = NULL;
+   glsl_shader_data_t   *glsl = (glsl_shader_data_t*)
+      calloc(1, sizeof(glsl_shader_data_t));
+
+   if (!glsl)
+      return NULL;
+
+   (void)shader_support;
+
+#ifndef HAVE_OPENGLES
+   RARCH_LOG("[GLSL] Checking GLSL shader support...\n");
+   shader_support = glCreateProgram && glUseProgram && glCreateShader
+      && glDeleteShader && glShaderSource && glCompileShader && glAttachShader
+      && glDetachShader && glLinkProgram && glGetUniformLocation
+      && glUniform1i && glUniform1f && glUniform2fv && glUniform4fv
+      && glUniformMatrix4fv
+      && glGetShaderiv && glGetShaderInfoLog && glGetProgramiv
+      && glGetProgramInfoLog
+      && glDeleteProgram && glGetAttachedShaders
+      && glGetAttribLocation && glEnableVertexAttribArray
+      && glDisableVertexAttribArray
+      && glVertexAttribPointer
+      && glGenBuffers && glBufferData && glDeleteBuffers && glBindBuffer;
+
+   if (!shader_support)
+   {
+      RARCH_ERR("[GLSL] GLSL shaders aren't supported by your OpenGL driver.\n");
+      goto error;
+   }
+#endif
+
+   glsl->shader = (struct video_shader*)calloc(1, sizeof(*glsl->shader));
+   if (!glsl->shader)
+      goto error;
+
+   {
+      bool is_preset;
+      enum rarch_shader_type type =
+         video_shader_get_type_from_ext(path_get_extension(path), &is_preset);
+
+      if (path && *path && type != RARCH_SHADER_GLSL)
+      {
+         RARCH_ERR("[GLSL] Invalid shader type, falling back to stock.\n");
+         path = NULL;
+      }
+
+      if (path && *path)
+      {
+         bool ret = false;
+
+         if (is_preset)
+         {
+            ret = video_shader_load_preset_into_shader(path, glsl->shader);
+            glsl->shader->flags |= SHDR_FLAG_MODERN;
+         }
+         else
+         {
+            strlcpy(glsl->shader->pass[0].source.path, path,
+                  sizeof(glsl->shader->pass[0].source.path));
+            glsl->shader->passes = 1;
+            glsl->shader->flags |= SHDR_FLAG_MODERN;
+            ret = true;
+         }
+
+         if (!ret)
+         {
+            RARCH_ERR("[GLSL] Failed to parse GLSL shader.\n");
+            goto error;
+         }
+      }
+      else
+      {
+         RARCH_WARN("[GLSL] Stock GLSL shaders will be used.\n");
+         glsl->shader->passes = 1;
+#if defined(VITA)
+         glsl->shader->pass[0].source.string.vertex   = strdup(stock_vertex_modern);
+         glsl->shader->pass[0].source.string.fragment = strdup(stock_fragment_modern);
+#else
+         glsl->shader->pass[0].source.string.vertex   =
+            strdup(glsl_core ? stock_vertex_core : stock_vertex_modern);
+         glsl->shader->pass[0].source.string.fragment =
+            strdup(glsl_core ? stock_fragment_core : stock_fragment_modern);
+#endif
+         glsl->shader->flags |= SHDR_FLAG_MODERN;
+      }
+   }
+
+#if defined(VITA)
+    stock_vertex = stock_vertex_modern;
+    stock_fragment = stock_fragment_modern;
+#else
+   stock_vertex = (glsl->shader->flags & SHDR_FLAG_MODERN) ?
+      stock_vertex_modern : stock_vertex_legacy;
+   stock_fragment = (glsl->shader->flags & SHDR_FLAG_MODERN) ?
+      stock_fragment_modern : stock_fragment_legacy;
+
+   if (glsl_core)
+   {
+      stock_vertex = stock_vertex_core;
+      stock_fragment = stock_fragment_core;
+   }
+#endif
+
+#ifdef HAVE_OPENGLES
+   if (!(glsl->shader->flags & SHDR_FLAG_MODERN))
+   {
+      RARCH_ERR("[GLSL] GLES context is used, but shader is not modern. Cannot use it.\n");
+      goto error;
+   }
+#else
+   if (      glsl_core
+         && (!(glsl->shader->flags & SHDR_FLAG_MODERN)))
+   {
+      RARCH_ERR("[GLSL] GL core context is used, but shader is not core compatible. Cannot use it.\n");
+      goto error;
+   }
+#endif
+
+   /* Find all aliases we use in our GLSLP and add #defines for them so
+    * that a shader can choose a fallback if we are not using a preset.
+    *
+    * Track a running offset into alias_define and let snprintf write
+    * directly at that offset; the prior strlcat-in-loop form scanned
+    * the buffer from the start on every iteration to find its end,
+    * giving O(passes^2) total cost. */
+   {
+      size_t alias_len   = 0;
+      size_t alias_avail = sizeof(glsl->alias_define);
+      glsl->alias_define[0] = '\0';
+      for (i = 0; i < glsl->shader->passes; i++)
+      {
+         int n;
+         if (!*glsl->shader->pass[i].alias)
+            continue;
+         if (alias_len + 1 >= alias_avail)
+            break;
+         n = snprintf(glsl->alias_define + alias_len,
+               alias_avail - alias_len,
+               "#define %s_ALIAS\n",
+               glsl->shader->pass[i].alias);
+         if (n < 0 || (size_t)n >= alias_avail - alias_len)
+            break;
+         alias_len += (size_t)n;
+      }
+   }
+
+   shader_prog_info.vertex   = stock_vertex;
+   shader_prog_info.fragment = stock_fragment;
+   shader_prog_info.is_file  = false;
+
+   if (!gl_glsl_compile_program(glsl, 0, &glsl->prg[0], &shader_prog_info))
+   {
+      RARCH_ERR("[GLSL] GLSL stock programs failed to compile.\n");
+      goto error;
+   }
+
+   if (!gl_glsl_compile_programs(glsl, &glsl->prg[1]))
+      goto error;
+
+   if (!gl2_load_luts(glsl->shader, glsl->lut_textures))
+   {
+      RARCH_ERR("[GLSL] Failed to load LUTs.\n");
+      goto error;
+   }
+
+   for (i = 0; i <= glsl->shader->passes; i++)
+      gl_glsl_find_uniforms(glsl, i, glsl->prg[i].id, &glsl->uniforms[i]);
+
+#ifdef GLSL_DEBUG
+   if (!gl_check_error(&err_string))
+   {
+      RARCH_ERR("%s\n", err_string);
+      free(err_string);
+      RARCH_WARN("[GLSL] Detected GL error in GLSL.\n");
+   }
+#endif
+
+   if (glsl_viewer_hdr) gl_glsl_viewer_prepare(glsl);
+
+   glsl->prg[glsl->shader->passes  + 1]     = glsl->prg[0];
+   glsl->uniforms[glsl->shader->passes + 1] = glsl->uniforms[0];
+
+   if (glsl->shader->flags & SHDR_FLAG_MODERN)
+   {
+#if defined(VITA)
+      shader_prog_info.vertex   = stock_vertex_modern_blend;
+      shader_prog_info.fragment = stock_fragment_modern_blend;
+#else
+      shader_prog_info.vertex   =
+            glsl_core ?
+            stock_vertex_core_blend : stock_vertex_modern_blend;
+      shader_prog_info.fragment =
+            glsl_core ?
+            stock_fragment_core_blend : stock_fragment_modern_blend;
+#endif
+      shader_prog_info.is_file  = false;
+
+      gl_glsl_compile_program(
+            glsl,
+            VIDEO_SHADER_STOCK_BLEND,
+            &glsl->prg[VIDEO_SHADER_STOCK_BLEND],
+            &shader_prog_info
+            );
+
+      gl_glsl_find_uniforms(glsl, 0, glsl->prg[VIDEO_SHADER_STOCK_BLEND].id,
+            &glsl->uniforms[VIDEO_SHADER_STOCK_BLEND]);
+   }
+   else
+   {
+      glsl->prg[VIDEO_SHADER_STOCK_BLEND] = glsl->prg[0];
+      glsl->uniforms[VIDEO_SHADER_STOCK_BLEND] = glsl->uniforms[0];
+   }
+
+   gl_glsl_reset_attrib(glsl);
+
+   for (i = 0; i < VIDEO_SHADER_PROGRAM_COUNT; i++)
+   {
+      glGenBuffers(1, &glsl->vbo[i].vbo_primary);
+      glGenBuffers(1, &glsl->vbo[i].vbo_secondary);
+   }
+
+   return glsl;
+
+error:
+   gl_glsl_destroy_resources(glsl);
+
+   if (glsl)
+      free(glsl);
+
+   {
+      size_t _len;
+      char msg[NAME_MAX_LENGTH];
+
+      _len = snprintf(msg, sizeof(msg), "Failed to compile shader: \"%s\".",
+            path_basename(path));
+
+      runloop_msg_queue_push(msg, _len, 1, 120, true, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_ERROR);
+   }
+
+   return NULL;
+}
+
+static void gl_glsl_set_uniform_parameter(
+      void *data,
+      struct uniform_info *param,
+      void *uniform_data)
+{
+   GLint            location = 0;
+   glsl_shader_data_t  *glsl = (glsl_shader_data_t*)data;
+
+   if (!glsl || !param)
+      return;
+
+   if (param->lookup.enable)
+      location = glGetUniformLocation(gl_glsl_program(glsl, param->lookup.idx)->id, param->lookup.ident);
+   else
+      location = param->location;
+
+   switch (param->type)
+   {
+      case UNIFORM_1F:
+         glUniform1f(location, param->result.f.v0);
+         break;
+      case UNIFORM_2F:
+         glUniform2f(location, param->result.f.v0,
+               param->result.f.v1);
+         break;
+      case UNIFORM_3F:
+         glUniform3f(location, param->result.f.v0,
+               param->result.f.v1, param->result.f.v2);
+         break;
+      case UNIFORM_4F:
+         glUniform4f(location, param->result.f.v0,
+               param->result.f.v1, param->result.f.v2,
+               param->result.f.v3);
+         break;
+      case UNIFORM_1FV:
+         glUniform1fv(location, 1, param->result.floatv);
+         break;
+      case UNIFORM_2FV:
+         glUniform2fv(location, 1, param->result.floatv);
+         break;
+      case UNIFORM_3FV:
+         glUniform3fv(location, 1, param->result.floatv);
+         break;
+      case UNIFORM_4FV:
+         glUniform4fv(location, param->count ? param->count : 1, param->result.floatv);
+         break;
+      case UNIFORM_1I:
+         glUniform1i(location, (GLint)param->result.integer.v0);
+         break;
+   }
+}
+
+static void gl_glsl_set_params(void *dat, void *shader_data)
+{
+   unsigned i;
+   GLfloat buffer[512];
+   struct glsl_attrib attribs[32];
+   float input_size[2], output_size[2], texture_size[2], final_vp_size[2];
+   video_shader_ctx_params_t          *params = (video_shader_ctx_params_t*)dat;
+   unsigned vp_width                          = VIDEO_SCALE_W(params->vp_dims);
+   unsigned vp_height                         = VIDEO_SCALE_H(params->vp_dims);
+   unsigned width                             = VIDEO_SCALE_W(params->dims);
+   unsigned height                            = VIDEO_SCALE_H(params->dims);
+   unsigned tex_width                         = VIDEO_SCALE_W(params->tex_dims);
+   unsigned tex_height                        = VIDEO_SCALE_H(params->tex_dims);
+   unsigned out_width                         = VIDEO_SCALE_W(params->out_dims);
+   unsigned out_height                        = VIDEO_SCALE_H(params->out_dims);
+   unsigned frame_count                       = params->frame_counter;
+   const void *_info                          = params->info;
+   const void *_prev_info                     = params->prev_info;
+   const void *_feedback_info                 = params->feedback_info;
+   const void *_fbo_info                      = params->fbo_info;
+   unsigned fbo_info_cnt                      = params->fbo_info_cnt;
+   unsigned                           texunit = 1;
+   const struct          shader_uniforms *uni = NULL;
+   size_t                                size = 0;
+   size_t                        attribs_size = 0;
+   const struct video_tex_info          *info = (const struct video_tex_info*)_info;
+   const struct video_tex_info     *prev_info = (const struct video_tex_info*)_prev_info;
+   const struct video_tex_info *feedback_info = (const struct video_tex_info*)_feedback_info;
+   const struct video_tex_info      *fbo_info = (const struct video_tex_info*)_fbo_info;
+   struct glsl_attrib                   *attr = (struct glsl_attrib*)attribs;
+   glsl_shader_data_t                   *glsl = (glsl_shader_data_t*)shader_data;
+
+   if (!glsl)
+      return;
+
+   uni = gl_glsl_uniforms(glsl, glsl->active_idx);
+
+   if (gl_glsl_program(glsl, glsl->active_idx)->id == 0)
+      return;
+
+   input_size [0]   = (float)width;
+   input_size [1]   = (float)height;
+   output_size[0]   = (float)out_width;
+   output_size[1]   = (float)out_height;
+   texture_size[0]  = (float)tex_width;
+   texture_size[1]  = (float)tex_height;
+   final_vp_size[0] = (float)vp_width;
+   final_vp_size[1] = (float)vp_height;
+
+   if (uni->input_size >= 0)
+      glUniform2fv(uni->input_size, 1, input_size);
+
+   if (uni->output_size >= 0)
+      glUniform2fv(uni->output_size, 1, output_size);
+
+   if (uni->texture_size >= 0)
+      glUniform2fv(uni->texture_size, 1, texture_size);
+
+   if (uni->final_vp_size >= 0)
+      glUniform2fv(uni->final_vp_size, 1, final_vp_size);
+
+   if (uni->frame_count >= 0 && glsl->active_idx)
+   {
+      unsigned modulo = glsl->shader->pass[glsl->active_idx - 1].frame_count_mod;
+
+      if (modulo)
+         frame_count %= modulo;
+
+      glUniform1i(uni->frame_count, frame_count);
+   }
+
+   /* Not modulo'd: SwapCount counts what the display was shown, so a
+    * pass's frame_count_mod has nothing to say about it. */
+   if (uni->swap_count >= 0)
+      glUniform1i(uni->swap_count, (int)params->swap_counter);
+
+   if (uni->frame_direction >= 0)
+   {
+#ifdef HAVE_REWIND
+      if (!glsl->media_source_dims && state_manager_frame_is_reversed())
+         glUniform1i(uni->frame_direction, -1);
+      else
+#endif
+         glUniform1i(uni->frame_direction, 1);
+   }
+
+  if (uni->frame_time_delta >= 0)
+      glUniform1i(uni->frame_time_delta, (GLint)video_driver_get_frame_time_delta_usec());
+
+  if (uni->original_fps >= 0)
+      glUniform1f(uni->original_fps, video_driver_get_original_fps());
+
+  if (uni->rotation >= 0)
+      glUniform1i(uni->rotation, (glsl->media_source_dims
+            ? 0 : video_driver_get_rotation_snapshot()));
+
+  if (uni->core_aspect >= 0)
+      glUniform1f(uni->core_aspect, (glsl->media_source_dims
+            ? (float)VIDEO_SCALE_W(glsl->media_source_dims) / VIDEO_SCALE_H(glsl->media_source_dims)
+            : video_driver_get_core_aspect()));
+
+  if (uni->core_aspect_rot >= 0)
+  {
+     /* OriginalAspectRotated: return 1/aspect for 90 and 270 rotated content */
+     float core_aspect_rot = (glsl->media_source_dims
+            ? (float)VIDEO_SCALE_W(glsl->media_source_dims) / VIDEO_SCALE_H(glsl->media_source_dims)
+            : video_driver_get_core_aspect());
+     uint32_t rot = (glsl->media_source_dims
+            ? 0 : video_driver_get_rotation_snapshot());
+     if (rot == 1 || rot == 3)
+        core_aspect_rot = 1/core_aspect_rot;
+     glUniform1f(uni->core_aspect_rot, core_aspect_rot);
+  }
+
+   /* Set lookup textures. */
+   for (i = 0; i < glsl->shader->luts; i++)
+   {
+      if (uni->lut_texture[i] < 0)
+         continue;
+
+      /* Have to rebind as HW render could override this. */
+      glActiveTexture(GL_TEXTURE0 + texunit);
+      glBindTexture(GL_TEXTURE_2D, glsl->lut_textures[i]);
+      glUniform1i(uni->lut_texture[i], texunit);
+      texunit++;
+   }
+
+   if (glsl->active_idx)
+   {
+      /* Set original texture. */
+      if (uni->orig.texture >= 0)
+      {
+         /* Bind original texture. */
+         glActiveTexture(GL_TEXTURE0 + texunit);
+         glUniform1i(uni->orig.texture, texunit);
+         glBindTexture(GL_TEXTURE_2D, info->tex);
+         texunit++;
+      }
+
+      if (uni->orig.texture_size >= 0)
+         glUniform2fv(uni->orig.texture_size, 1, info->tex_size);
+
+      if (uni->orig.input_size >= 0)
+         glUniform2fv(uni->orig.input_size, 1, info->input_size);
+
+      /* Pass texture coordinates. */
+      if (uni->orig.tex_coord >= 0)
+      {
+         attr->loc    = uni->orig.tex_coord;
+         attr->size   = 2;
+         attr->offset = (GLsizei)(size * sizeof(GLfloat));
+         attribs_size++;
+         attr++;
+
+         buffer[size ]       = info->coord[0];
+         buffer[size + 1]    = info->coord[1];
+         buffer[size + 2]    = info->coord[2];
+         buffer[size + 3]    = info->coord[3];
+         buffer[size + 4]    = info->coord[4];
+         buffer[size + 5]    = info->coord[5];
+         buffer[size + 6]    = info->coord[6];
+         buffer[size + 7]    = info->coord[7];
+         size += 8;
+      }
+
+      /* Set feedback texture. */
+      if (uni->feedback.texture >= 0)
+      {
+         /* Bind original texture. */
+         glActiveTexture(GL_TEXTURE0 + texunit);
+         glUniform1i(uni->feedback.texture, texunit);
+         glBindTexture(GL_TEXTURE_2D, feedback_info->tex);
+         texunit++;
+      }
+
+      if (uni->feedback.texture_size >= 0)
+         glUniform2fv(uni->feedback.texture_size, 1, feedback_info->tex_size);
+
+      if (uni->feedback.input_size >= 0)
+         glUniform2fv(uni->feedback.input_size, 1, feedback_info->input_size);
+
+      /* Pass texture coordinates. */
+      if (uni->feedback.tex_coord >= 0)
+      {
+         attr->loc    = uni->feedback.tex_coord;
+         attr->size   = 2;
+         attr->offset = (GLsizei)(size * sizeof(GLfloat));
+         attribs_size++;
+         attr++;
+
+         buffer[size  ]      = feedback_info->coord[0];
+         buffer[size + 1]    = feedback_info->coord[1];
+         buffer[size + 2]    = feedback_info->coord[2];
+         buffer[size + 3]    = feedback_info->coord[3];
+         buffer[size + 4]    = feedback_info->coord[4];
+         buffer[size + 5]    = feedback_info->coord[5];
+         buffer[size + 6]    = feedback_info->coord[6];
+         buffer[size + 7]    = feedback_info->coord[7];
+         size += 8;
+      }
+
+      /* Bind FBO textures. */
+      for (i = 0; i < fbo_info_cnt; i++)
+      {
+         if (uni->pass[i].texture)
+         {
+            glActiveTexture(GL_TEXTURE0 + texunit);
+            glBindTexture(GL_TEXTURE_2D, fbo_info[i].tex);
+            glUniform1i(uni->pass[i].texture, texunit);
+            texunit++;
+         }
+
+          if (uni->pass[i].texture_size >= 0)
+            glUniform2fv(uni->pass[i].texture_size, 1, fbo_info[i].tex_size);
+
+         if (uni->pass[i].input_size >= 0)
+            glUniform2fv(uni->pass[i].input_size, 1, fbo_info[i].input_size);
+
+         if (uni->pass[i].tex_coord >= 0)
+         {
+            attr->loc    = uni->pass[i].tex_coord;
+            attr->size   = 2;
+            attr->offset = (GLsizei)(size * sizeof(GLfloat));
+            attribs_size++;
+            attr++;
+
+            buffer[size  ]      = fbo_info[i].coord[0];
+            buffer[size + 1]    = fbo_info[i].coord[1];
+            buffer[size + 2]    = fbo_info[i].coord[2];
+            buffer[size + 3]    = fbo_info[i].coord[3];
+            buffer[size + 4]    = fbo_info[i].coord[4];
+            buffer[size + 5]    = fbo_info[i].coord[5];
+            buffer[size + 6]    = fbo_info[i].coord[6];
+            buffer[size + 7]    = fbo_info[i].coord[7];
+            size += 8;
+         }
+      }
+   }
+
+   /* Set previous textures. Only bind if they're actually used. */
+   for (i = 0; i < PREV_TEXTURES; i++)
+   {
+      if (uni->prev[i].texture >= 0)
+      {
+         glActiveTexture(GL_TEXTURE0 + texunit);
+         glBindTexture(GL_TEXTURE_2D, prev_info[i].tex);
+         glUniform1i(uni->prev[i].texture, texunit);
+         texunit++;
+      }
+
+      if (uni->prev[i].texture_size >= 0)
+         glUniform2fv(uni->prev[i].texture_size, 1, prev_info[i].tex_size);
+
+      if (uni->prev[i].input_size >= 0)
+         glUniform2fv(uni->prev[i].input_size, 1, prev_info[i].input_size);
+
+      /* Pass texture coordinates. */
+      if (uni->prev[i].tex_coord >= 0)
+      {
+         attr->loc    = uni->prev[i].tex_coord;
+         attr->size   = 2;
+         attr->offset = (GLsizei)(size * sizeof(GLfloat));
+         attribs_size++;
+         attr++;
+
+         buffer[size  ]      = prev_info[i].coord[0];
+         buffer[size + 1]    = prev_info[i].coord[1];
+         buffer[size + 2]    = prev_info[i].coord[2];
+         buffer[size + 3]    = prev_info[i].coord[3];
+         buffer[size + 4]    = prev_info[i].coord[4];
+         buffer[size + 5]    = prev_info[i].coord[5];
+         buffer[size + 6]    = prev_info[i].coord[6];
+         buffer[size + 7]    = prev_info[i].coord[7];
+         size += 8;
+      }
+   }
+
+   if (size)
+      gl_glsl_set_attribs(glsl, glsl->vbo[glsl->active_idx].vbo_secondary,
+            &glsl->vbo[glsl->active_idx].buffer_secondary,
+            &glsl->vbo[glsl->active_idx].len_secondary,
+            buffer, size, attribs, attribs_size);
+
+   glActiveTexture(GL_TEXTURE0);
+
+   /* #pragma parameters. */
+   for (i = 0; i < glsl->shader->num_parameters; i++)
+   {
+
+      int location = glGetUniformLocation(
+            gl_glsl_program(glsl, glsl->active_idx)->id,
+            glsl->shader->parameters[i].id);
+      glUniform1f(location,
+            video_shader_param_get(&glsl->shader->parameters[i]));
+   }
+
+   /* Sensor uniforms — values are 0.0 if sensors disabled or not available */
+   {
+      const struct shader_uniforms *uni = gl_glsl_uniforms(glsl, glsl->active_idx);
+      /* One coherent seqlock'd snapshot of the values
+       * input_driver_poll() published on the main thread. */
+      float gyro[3], accel[3], rest[3];
+      input_driver_read_sensor_snapshot(gyro, accel, rest);
+
+      if (uni->gyroscope >= 0)
+         glUniform3fv(uni->gyroscope, 1, gyro);
+      if (uni->accelerometer >= 0)
+         glUniform3fv(uni->accelerometer, 1, accel);
+      if (uni->accelerometer_rest >= 0)
+         glUniform3fv(uni->accelerometer_rest, 1, rest);
+   }
+}
+
+static bool gl_glsl_set_mvp(void *shader_data, const void *mat_data)
+{
+   int loc;
+   glsl_shader_data_t *glsl   = (glsl_shader_data_t*)shader_data;
+
+   if (      !glsl
+         || (!(glsl->shader->flags & SHDR_FLAG_MODERN)))
+      return false;
+
+   loc = gl_glsl_uniforms(glsl, glsl->active_idx)->mvp;
+   if (loc >= 0)
+   {
+      const math_matrix_4x4 *mat = (const math_matrix_4x4*)mat_data;
+
+      if (  (glsl->current_idx != glsl->active_idx) ||
+            (mat->data  != glsl->current_mat_data_pointer[glsl->active_idx]) ||
+            (*mat->data != glsl->current_mat_data[glsl->active_idx]))
+      {
+         glUniformMatrix4fv(loc, 1, GL_FALSE, mat->data);
+         glsl->current_idx                                = glsl->active_idx;
+         glsl->current_mat_data_pointer[glsl->active_idx] = (float*)mat->data;
+         glsl->current_mat_data[glsl->active_idx]         = *mat->data;
+      }
+   }
+
+   return true;
+}
+
+#define gl_glsl_set_coord_array(attribs, coord1, coord2, coords, size, multiplier) \
+   unsigned y; \
+   attribs[attribs_size].loc            = (GLint)coord1; \
+   attribs[attribs_size].size           = (GLsizei)multiplier; \
+   attribs[attribs_size].offset         = (GLsizei)(size * sizeof(GLfloat)); \
+   for (y = 0; y < (multiplier * coords->vertices); y++) \
+      buffer[y + size]  = coord2[y]; \
+   size                += multiplier * coords->vertices; \
+
+static bool gl_glsl_set_coords(void *shader_data,
+      const struct video_coords *coords)
+{
+   GLfloat short_buffer[4 * (2 + 2 + 4 + 2)];
+   struct glsl_attrib attribs[4];
+   size_t               attribs_size = 0;
+   size_t                       size = 0;
+   GLfloat *buffer                   = short_buffer;
+   glsl_shader_data_t          *glsl = (glsl_shader_data_t*)shader_data;
+   const struct shader_uniforms *uni = glsl
+      ? gl_glsl_uniforms(glsl, glsl->active_idx) : NULL;
+
+   if (     !glsl
+         || (!(glsl->shader->flags & SHDR_FLAG_MODERN))
+         || !coords)
+   {
+      if (coords)
+         return false;
+      return true;
+   }
+
+   if (coords->vertices > 4)
+   {
+      /* Avoid hitting malloc on every single regular quad draw. */
+
+      /* Must match the four bind conditions below exactly: a stream
+       * the caller did not supply is not bound and takes no room. */
+      size_t elems  = 0;
+      elems        += (uni->color         >= 0 && coords->color)         * 4;
+      elems        += (uni->tex_coord     >= 0 && coords->tex_coord)     * 2;
+      elems        += (uni->vertex_coord  >= 0 && coords->vertex)        * 2;
+      elems        += (uni->lut_tex_coord >= 0 && coords->lut_tex_coord) * 2;
+
+      elems        *= coords->vertices * sizeof(GLfloat);
+
+      if (elems > glsl->coord_scratch_cap)
+      {
+         GLfloat *grown = (GLfloat*)realloc(glsl->coord_scratch, elems);
+         if (!grown)
+            return false;
+         glsl->coord_scratch     = grown;
+         glsl->coord_scratch_cap = elems;
+      }
+      buffer        = glsl->coord_scratch;
+   }
+
+#if defined(VITA)
+   if (uni->time >= 0)
+   {
+      float t = (sceKernelGetSystemTimeWide()) / (scePowerGetArmClockFrequency() * 1000.0);
+      glUniform1f(uni->time, t);
+   }
+#endif
+
+
+
+   if (uni->tex_coord >= 0 && coords->tex_coord)
+   {
+      gl_glsl_set_coord_array(attribs, uni->tex_coord,
+            coords->tex_coord, coords, size, 2);
+      attribs_size++;
+   }
+
+   if (uni->vertex_coord >= 0 && coords->vertex)
+   {
+      gl_glsl_set_coord_array(attribs, uni->vertex_coord,
+            coords->vertex, coords, size, 2);
+      attribs_size++;
+   }
+
+   if (uni->color >= 0 && coords->color)
+   {
+      gl_glsl_set_coord_array(attribs, uni->color,
+            coords->color, coords, size, 4);
+      attribs_size++;
+   }
+
+   if (uni->lut_tex_coord >= 0 && coords->lut_tex_coord)
+   {
+      gl_glsl_set_coord_array(attribs, uni->lut_tex_coord,
+            coords->lut_tex_coord, coords, size, 2);
+      attribs_size++;
+   }
+
+   if (size)
+      gl_glsl_set_attribs(glsl,
+            glsl->vbo[glsl->active_idx].vbo_primary,
+            &glsl->vbo[glsl->active_idx].buffer_primary,
+            &glsl->vbo[glsl->active_idx].len_primary,
+            buffer, size,
+            attribs, attribs_size);
+
+   return true;
+}
+
+#ifdef HAVE_SHADERPIPELINE
+bool gl_glsl_effect_compile(gl_glsl_effect_t *fx,
+      const gfx_display_effect_desc_t *desc)
+{
+   /* The settings the compile reads: no alias defines, not quiet */
+   static glsl_shader_data_t compile;
+   unsigned dialect = glsl_core ? 1 : 0;
+   GLuint vs, fs, id;
+   bool ok;
+#if defined(HAVE_OPENGLES) && !defined(VITA)
+   /* Outside glsl_core only a source naming its own version is given
+    * one; the in/out sources that leave it to glsl_core would be read
+    * as GLSL ES 1.00 */
+   if (     gl_check_capability(GL_CAPS_GLES3_SUPPORTED)
+         && desc->glsl_vertex[1] && strstr(desc->glsl_vertex[1], "#version"))
+      dialect = 1;
+#endif
+   memset(fx, 0, sizeof(*fx));
+   if (!desc->glsl_vertex[dialect] || !desc->glsl_fragment[dialect])
+      return false;
+   if (!(id = glCreateProgram()))
+      return false;
+   vs = glCreateShader(GL_VERTEX_SHADER);
+   fs = glCreateShader(GL_FRAGMENT_SHADER);
+   ok =     gl_glsl_compile_shader(&compile, vs,
+               "#define VERTEX\n#define PARAMETER_UNIFORM\n#define _HAS_ORIGINALASPECT_UNIFORMS\n#define _HAS_FRAMETIME_UNIFORMS\n#define _HAS_SENSOR_UNIFORMS\n#define _HAS_SWAPCOUNT_UNIFORM\n",
+               desc->glsl_vertex[dialect])
+         && gl_glsl_compile_shader(&compile, fs,
+               "#define FRAGMENT\n#define PARAMETER_UNIFORM\n#define _HAS_ORIGINALASPECT_UNIFORMS\n#define _HAS_FRAMETIME_UNIFORMS\n#define _HAS_SENSOR_UNIFORMS\n#define _HAS_SWAPCOUNT_UNIFORM\n",
+               desc->glsl_fragment[dialect]);
+   if (ok)
+   {
+      glAttachShader(id, vs);
+      glAttachShader(id, fs);
+      ok = gl_glsl_link_program(id, false);
+      glUseProgram(0);
+   }
+   glDeleteShader(vs);
+   glDeleteShader(fs);
+   if (!ok)
+   {
+      glDeleteProgram(id);
+      return false;
+   }
+   fx->prog          = id;
+   fx->vertex_coord  = glGetAttribLocation(id, "VertexCoord");
+   fx->tex_coord     = glGetAttribLocation(id, "TexCoord");
+   fx->color         = glGetAttribLocation(id, "Color");
+   fx->mvp           = glGetUniformLocation(id, "MVPMatrix");
+   fx->time          = glGetUniformLocation(id, "time");
+   if (fx->time < 0)
+      fx->time       = glGetUniformLocation(id, "Time");
+   fx->ribbon        = glGetUniformLocation(id, "Ribbon");
+   fx->output_size   = glGetUniformLocation(id, "OutputSize");
+   return true;
+}
+#endif
+
+static void gl_glsl_compile_plastic(glsl_shader_data_t *glsl, unsigned idx)
+{
+   char source[2048];
+   struct shader_program_info info;
+   bool font = idx == VIDEO_SHADER_XMB_FONT_PLASTIC;
+#if defined(VITA)
+   const char *prefix =
+      "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n"
+      "#define mix lerp\n#define XMB_SAMPLE(p) tex2D(vTexture,p)\n"
+      "#define dFdx ddx\n#define dFdy ddy\n"
+      "#define XMB_COVERAGE(p) XMB_SAMPLE(p).a\n"
+      "void main(uniform sampler2D vTexture,float2 uv:TEXCOORD0,"
+      "float4 tint:COLOR,out float4 result:COLOR){";
+   const char *suffix = "result=plastic;}";
+   info.vertex = stock_vertex_modern_blend;
+#else
+   const char *prefix = glsl_core
+      ? "#if defined(GL_ES) && __VERSION__ < 300\n"
+        "#extension GL_OES_standard_derivatives : enable\n#endif\n"
+        "#ifdef GL_ES\n#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+        "precision highp float;\n#else\nprecision mediump float;\n#endif\n#endif\n"
+        "#define XMB_SAMPLE(p) texture(Texture,p)\n"
+        "#define XMB_COVERAGE(p) XMB_SAMPLE(p).a\n"
+        "uniform sampler2D Texture;in vec2 tex_coord;in vec4 color;"
+        "out vec4 FragColor;void main(){vec2 uv=tex_coord;vec4 tint=color;"
+      : "#if defined(GL_ES) && __VERSION__ < 300\n"
+        "#extension GL_OES_standard_derivatives : enable\n#endif\n"
+        "#ifdef GL_ES\n#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+        "precision highp float;\n#else\nprecision mediump float;\n#endif\n#endif\n"
+        "#define XMB_SAMPLE(p) texture2D(Texture,p)\n"
+        "#define XMB_COVERAGE(p) XMB_SAMPLE(p).a\n"
+        "uniform sampler2D Texture;varying vec2 tex_coord;varying vec4 color;"
+        "void main(){vec2 uv=tex_coord;vec4 tint=color;";
+   const char *suffix = glsl_core
+      ? "FragColor=plastic;}" : "gl_FragColor=plastic;}";
+   info.vertex = glsl_core ? stock_vertex_core_blend : stock_vertex_modern_blend;
+#endif
+   glsl->plastic_tried |= font ? 2 : 1;
+   if (!xmb_plastic_source(source, sizeof(source), prefix, suffix, font))
+      return;
+   info.fragment = source;
+   info.is_file  = false;
+   if (gl_glsl_compile_program(glsl, idx,
+            &glsl->prg[idx], &info))
+      gl_glsl_find_uniforms(glsl, 0,
+            glsl->prg[idx].id,
+            &glsl->uniforms[idx]);
+}
+
+static void gl_glsl_use(void *data, void *shader_data, unsigned idx, bool set_active)
+{
+   GLuint id;
+
+   if (set_active)
+   {
+      glsl_shader_data_t *glsl = (glsl_shader_data_t*)shader_data;
+      if (!glsl)
+         return;
+
+      if (idx == VIDEO_SHADER_XMB_PLASTIC
+            || idx == VIDEO_SHADER_XMB_FONT_PLASTIC)
+      {
+         unsigned bit = idx == VIDEO_SHADER_XMB_PLASTIC ? 1 : 2;
+         if (!(glsl->plastic_tried & bit))
+            gl_glsl_compile_plastic(glsl, idx);
+         if (!glsl->prg[idx].id)
+            idx = VIDEO_SHADER_STOCK_BLEND;
+      }
+      gl_glsl_reset_attrib(glsl);
+      glsl->active_idx        = idx;
+      id                      = gl_glsl_program(glsl, idx)->id;
+   }
+   else
+      id = (GLuint)idx;
+
+   glUseProgram(id);
+}
+
+static unsigned gl_glsl_num(void *data)
+{
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)data;
+   if (glsl && glsl->shader)
+      return glsl->shader->passes;
+   return 0;
+}
+
+static bool gl_glsl_filter_type(void *data, unsigned idx, bool *smooth)
+{
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)data;
+   if (glsl && idx
+         && (glsl->shader->pass[idx - 1].filter != RARCH_FILTER_UNSPEC)
+      )
+   {
+      *smooth = (glsl->shader->pass[idx - 1].filter == RARCH_FILTER_LINEAR);
+      return true;
+   }
+   return false;
+}
+
+static enum gfx_wrap_type gl_glsl_wrap_type(void *data, unsigned idx)
+{
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)data;
+   if (glsl && idx)
+      return glsl->shader->pass[idx - 1].wrap;
+   return RARCH_WRAP_BORDER;
+}
+
+static void gl_glsl_shader_scale(void *data, unsigned idx, struct gfx_fbo_scale *scale)
+{
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)data;
+   if (glsl && idx)
+      *scale        = glsl->shader->pass[idx - 1].fbo;
+   else
+      scale->flags &= ~FBO_SCALE_FLAG_VALID;
+}
+
+static unsigned gl_glsl_get_prev_textures(void *data)
+{
+   unsigned i, j;
+   unsigned max_prev = 0;
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)data;
+
+   if (!glsl)
+      return 0;
+
+   for (i = 1; i <= glsl->shader->passes; i++)
+      for (j = 0; j < PREV_TEXTURES; j++)
+         if (glsl->uniforms[i].prev[j].texture >= 0)
+            max_prev = MAX(j + 1, max_prev);
+
+   return max_prev;
+}
+
+static bool gl_glsl_mipmap_input(void *data, unsigned idx)
+{
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)data;
+   if (glsl && idx)
+      return glsl->shader->pass[idx - 1].mipmap;
+   return false;
+}
+
+static bool gl_glsl_get_feedback_pass(void *data, unsigned *index)
+{
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)data;
+   if (!glsl || glsl->shader->feedback_pass < 0)
+      return false;
+
+   *index = glsl->shader->feedback_pass;
+   return true;
+}
+
+static struct video_shader *gl_glsl_get_current_shader(void *data)
+{
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)data;
+   if (!glsl)
+      return NULL;
+   return glsl->shader;
+}
+
+static void gl_glsl_get_flags(uint32_t *flags)
+{
+   BIT32_SET(*flags, GFX_CTX_FLAGS_SHADERS_GLSL);
+}
+
+void gl_glsl_set_context_type(bool core_profile,
+      unsigned major, unsigned minor)
+{
+   glsl_viewer_hdr = false;
+   glsl_core  = core_profile;
+   glsl_major = major;
+   glsl_minor = minor;
+}
+
+
+void gl_glsl_set_viewer_hdr(bool enabled)
+{
+   glsl_viewer_hdr = enabled;
+}
+
+bool gl_glsl_draw_mesh(void *shader_data, unsigned vbo, unsigned ibo,
+      unsigned count, bool strip, const float *mvp, const float *tint)
+{
+   static const char *attr_names[3] = { "VertexCoord", "TexCoord", "Color" };
+   static const GLint attr_sizes[3] = { 3, 2, 4 };
+   static const GLenum attr_types[3] = { GL_FLOAT, GL_UNSIGNED_SHORT,
+      GL_UNSIGNED_BYTE };
+   static const size_t attr_offsets[3] = { 0, 12, 16 };
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)shader_data;
+   GLenum mode              = strip ? GL_TRIANGLE_STRIP : GL_TRIANGLES;
+   unsigned i;
+
+   if (!glsl || glsl->mesh_failed)
+      return false;
+   if (!glsl->mesh_prg)
+   {
+      struct shader_program_glsl_data program;
+      struct shader_program_info info;
+      memset(&program, 0, sizeof(program));
+      info.data     = NULL;
+      info.vertex   = glsl_core ? stock_vertex_mesh_core   : stock_vertex_mesh_legacy;
+      info.fragment = glsl_core ? stock_fragment_mesh_core : stock_fragment_mesh_legacy;
+      info.combined = NULL;
+      info.idx      = 0;
+      info.is_file  = false;
+      if (!gl_glsl_compile_program(glsl, 0, &program, &info) || !program.id)
+      {
+         glsl->mesh_failed = true;
+         return false;
+      }
+      glsl->mesh_prg  = program.id;
+      glsl->mesh_mvp  = glGetUniformLocation(program.id, "MVPMatrix");
+      glsl->mesh_tint = glGetUniformLocation(program.id, "Tint");
+      for (i = 0; i < 3; i++)
+         glsl->mesh_attr[i] = glGetAttribLocation(program.id, attr_names[i]);
+      if (glsl->mesh_mvp < 0 || glsl->mesh_attr[0] < 0)
+      {
+         glDeleteProgram(glsl->mesh_prg);
+         glsl->mesh_prg    = 0;
+         glsl->mesh_failed = true;
+         return false;
+      }
+   }
+
+   glUseProgram(glsl->mesh_prg);
+   glUniformMatrix4fv(glsl->mesh_mvp, 1, GL_FALSE, mvp);
+   if (glsl->mesh_tint >= 0)
+      glUniform4fv(glsl->mesh_tint, 1, tint);
+
+   /* Read as the mesh stores it, 20 bytes a vertex */
+   glBindBuffer(GL_ARRAY_BUFFER, vbo);
+   for (i = 0; i < 3; i++)
+   {
+      if (glsl->mesh_attr[i] < 0)
+         continue;
+      glEnableVertexAttribArray(glsl->mesh_attr[i]);
+      glVertexAttribPointer(glsl->mesh_attr[i], attr_sizes[i],
+            attr_types[i], i ? GL_TRUE : GL_FALSE, 20,
+            (const GLvoid*)(uintptr_t)attr_offsets[i]);
+   }
+   if (ibo)
+   {
+      glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+      glDrawElements(mode, count, GL_UNSIGNED_SHORT, (const GLvoid*)0);
+      glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+   }
+   else
+      glDrawArrays(mode, 0, count);
+   for (i = 0; i < 3; i++)
+      if (glsl->mesh_attr[i] >= 0)
+         glDisableVertexAttribArray(glsl->mesh_attr[i]);
+   glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+   /* Whatever the caller draws next draws with its own program */
+   glUseProgram(gl_glsl_program(glsl, glsl->active_idx)->id);
+   return true;
+}
+
+#ifndef GL_CLAMP_TO_BORDER
+#define GL_CLAMP_TO_BORDER 0x812D
+#endif
+
+/* The in-place record's programs let go of */
+static void gl_glsl_in_place_free(glsl_shader_data_t *glsl)
+{
+   unsigned i;
+   struct glsl_in_place *ip = &glsl->in_place;
+   for (i = 0; i < ip->count; i++)
+      if (ip->pass[i].prg.id)
+         glDeleteProgram(ip->pass[i].prg.id);
+   free(ip->pass);
+   memset(ip, 0, sizeof(*ip));
+}
+
+/* 1 when @name is the frame in program @p (the first pass's input, the
+ * original, or PassPrev@p, which is the original too), 0 when it is a
+ * sampler the pass is given otherwise, -1 when it is anything else:
+ * earlier frames, which only copies hold, or a *Texture name nothing
+ * binds. A name not ending in Texture is never bound, so it keeps the
+ * unit 0 every sampler links with, which holds the pass's input */
+static int gl_glsl_in_place_sampler(const glsl_shader_data_t *glsl,
+      unsigned p, const char *name)
+{
+   unsigned k;
+   const char *pre[3];
+   size_t len = strlen(name);
+   for (k = 0; k < glsl->shader->luts; k++)
+      if (string_is_equal(name, glsl->shader->lut[k].id))
+         return 0;
+   if (len < 7 || !string_is_equal(name + len - 7, "Texture"))
+      return p == 1 ? 1 : 0;
+   pre[0] = glsl->shader->prefix;
+   pre[1] = glsl_prefixes[0];
+   pre[2] = glsl_prefixes[1];
+   for (k = 0; k < 3; k++)
+   {
+      char base[64];
+      size_t pl = strlen(pre[k]);
+      unsigned n, i;
+      char tail;
+      if (pl + 7 > len || strncmp(name, pre[k], pl))
+         continue;
+      if (len - 7 - pl >= sizeof(base))
+         continue;
+      memcpy(base, name + pl, len - 7 - pl);
+      base[len - 7 - pl] = '\0';
+      if (!*base)
+         return p == 1 ? 1 : 0;
+      if (string_is_equal(base, "Orig"))
+         return 1;
+      if (string_is_equal(base, "Feedback"))
+         return 0;
+      if (sscanf(base, "PassPrev%u%c", &n, &tail) == 1)
+         return n == p ? 1 : n < p ? 0 : -1;
+      if (sscanf(base, "Pass%u%c", &n, &tail) == 1)
+         return n && n < p ? 0 : -1;
+      for (i = 0; i + 1 < p; i++)
+         if (     *glsl->shader->pass[i].alias
+               && string_is_equal(base, glsl->shader->pass[i].alias))
+            return 0;
+   }
+   return -1;
+}
+
+/* Program @p's frame sampler names into @names (up to @cap, @len each),
+ * their count, or -1 when it reads something only a copy can give */
+static int gl_glsl_in_place_names(const glsl_shader_data_t *glsl,
+      unsigned p, char (*names)[64], unsigned cap)
+{
+   GLint i, count = 0;
+   int num        = 0;
+   GLuint prog    = glsl->prg[p].id;
+   if (!prog)
+      return -1;
+   glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &count);
+   for (i = 0; i < count; i++)
+   {
+      char name[64];
+      char *bracket;
+      int kind;
+      GLint size  = 0;
+      GLenum type = 0;
+      name[0]     = '\0';
+      glGetActiveUniform(prog, (GLuint)i, sizeof(name), NULL, &size, &type,
+            name);
+      if (type != GL_SAMPLER_2D)
+         continue;
+      if ((bracket = strchr(name, '[')))
+         *bracket = '\0';
+      if ((kind = gl_glsl_in_place_sampler(glsl, p, name)) < 0)
+         return -1;
+      if (kind)
+      {
+         if ((unsigned)num == cap)
+            return -1;
+         strlcpy(names[num++], name, sizeof(names[0]));
+      }
+   }
+   return num;
+}
+
+bool gl_glsl_in_place(void *shader_data, unsigned filter, unsigned wrap)
+{
+   unsigned key;
+   enum glsl_rect_mode mode;
+   unsigned p, passes;
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)shader_data;
+   struct glsl_in_place *ip;
+
+#if defined(VITA)
+   /* Its shaders name the frame vTexture, which is not looked for */
+   return false;
+#endif
+   if (!glsl || !glsl->shader)
+      return false;
+   ip = &glsl->in_place;
+   if (filter == GL_LINEAR && wrap == GL_CLAMP_TO_EDGE)
+      mode = GLSL_RECT_LINEAR_EDGE;
+   else if (filter == GL_NEAREST && wrap == GL_CLAMP_TO_EDGE)
+      mode = GLSL_RECT_NEAREST_EDGE;
+   else if (filter == GL_NEAREST && wrap == GL_REPEAT)
+      mode = GLSL_RECT_NEAREST_REPEAT;
+   else if (filter == GL_NEAREST && wrap == GL_MIRRORED_REPEAT)
+      mode = GLSL_RECT_NEAREST_MIRROR;
+   else if (filter == GL_NEAREST && wrap == GL_CLAMP_TO_BORDER)
+      mode = GLSL_RECT_NEAREST_BORDER;
+   else
+      return false;
+   key = 1 + (unsigned)mode;
+   if (ip->key == key)
+      return ip->ok;
+
+   /* Another filter or wrap: the rewrite for it, tried once */
+   gl_glsl_in_place_end(glsl);
+   gl_glsl_in_place_free(glsl);
+   ip->key  = key;
+   ip->mode = mode;
+   passes   = glsl->shader->passes;
+   if (     !passes || passes + 1 >= GFX_MAX_SHADERS
+         || !(ip->pass = (struct glsl_in_place_pass*)
+            calloc(passes, sizeof(*ip->pass))))
+      return false;
+   for (p = 1; p <= passes; p++)
+   {
+      char names[4][64];
+      const char *list[4];
+      struct shader_program_info info;
+      struct glsl_in_place_pass *ipp;
+      char *vertex, *fragment;
+      int i, num = gl_glsl_in_place_names(glsl, p, names, 4);
+      bool made  = false;
+      if (num < 0)
+         return false;
+      if (!num)
+         continue;
+      for (i = 0; i < num; i++)
+         list[i] = names[i];
+      ipp      = &ip->pass[ip->count];
+      vertex   = glsl_rect_rewrite(
+            glsl->shader->pass[p - 1].source.string.vertex, list,
+            (unsigned)num, mode);
+      fragment = glsl_rect_rewrite(
+            glsl->shader->pass[p - 1].source.string.fragment, list,
+            (unsigned)num, mode);
+      if (vertex && fragment)
+      {
+         info.vertex   = vertex;
+         info.fragment = fragment;
+         info.is_file  = false;
+         glsl->quiet   = true;
+         made          = gl_glsl_compile_program(glsl, p, &ipp->prg, &info);
+         glsl->quiet   = false;
+      }
+      free(vertex);
+      free(fragment);
+      if (!made)
+         return false;
+      ip->count++;
+      ipp->idx = p;
+      gl_glsl_find_uniforms(glsl, p, ipp->prg.id, &ipp->uni);
+      ipp->loc[0] = glGetUniformLocation(ipp->prg.id, GLSL_RECT_NAME_RECT);
+      ipp->loc[1] = glGetUniformLocation(ipp->prg.id, GLSL_RECT_NAME_CLAMP);
+      ipp->loc[2] = glGetUniformLocation(ipp->prg.id, GLSL_RECT_NAME_TEXELS);
+   }
+   if ((ip->ok = ip->count > 0))
+      RARCH_LOG("[GLSL] %u of %u passes read a hardware frame's views "
+            "where they lie.\n", ip->count, passes);
+   return ip->ok;
+}
+
+/* @a and @b exchanged, @size bytes, through a little stack */
+static void gl_glsl_swap_bytes(void *a, void *b, size_t size)
+{
+   unsigned char tmp[256];
+   unsigned char *x = (unsigned char*)a;
+   unsigned char *y = (unsigned char*)b;
+   while (size)
+   {
+      size_t n = size < sizeof(tmp) ? size : sizeof(tmp);
+      memcpy(tmp, x, n);
+      memcpy(x, y, n);
+      memcpy(y, tmp, n);
+      x    += n;
+      y    += n;
+      size -= n;
+   }
+}
+
+/* The passes' programs and uniforms, and the rewritten ones, change
+ * places */
+static void gl_glsl_in_place_swap(glsl_shader_data_t *glsl)
+{
+   unsigned i;
+   struct glsl_in_place *ip = &glsl->in_place;
+   for (i = 0; i < ip->count; i++)
+   {
+      struct glsl_in_place_pass *ipp = &ip->pass[i];
+      gl_glsl_swap_bytes(&glsl->prg[ipp->idx], &ipp->prg, sizeof(ipp->prg));
+      gl_glsl_swap_bytes(&glsl->uniforms[ipp->idx], &ipp->uni,
+            sizeof(ipp->uni));
+      /* Its MVP is not the other program's */
+      glsl->current_mat_data_pointer[ipp->idx] = NULL;
+   }
+   ip->swapped = !ip->swapped;
+}
+
+void gl_glsl_in_place_begin(void *shader_data, bool flipped,
+      unsigned view_pos, unsigned view_dims, unsigned frame_h,
+      unsigned tex_dims)
+{
+   unsigned i;
+   float v[12];
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)shader_data;
+   struct glsl_in_place *ip;
+   if (!glsl || !glsl->in_place.ok)
+      return;
+   ip = &glsl->in_place;
+   if (!ip->swapped)
+      gl_glsl_in_place_swap(glsl);
+   glsl_rect_values(ip->mode, flipped, (unsigned)VIDEO_POS_X(view_pos),
+         (unsigned)VIDEO_POS_Y(view_pos), VIDEO_SCALE_W(view_dims),
+         VIDEO_SCALE_H(view_dims), frame_h, VIDEO_SCALE_W(tex_dims),
+         VIDEO_SCALE_H(tex_dims), v);
+   for (i = 0; i < ip->count; i++)
+   {
+      const struct glsl_in_place_pass *ipp = &ip->pass[i];
+      glUseProgram(glsl->prg[ipp->idx].id);
+      if (ipp->loc[0] >= 0)
+         glUniform4fv(ipp->loc[0], 1, v);
+      if (ipp->loc[1] >= 0)
+         glUniform4fv(ipp->loc[1], 1, v + 4);
+      if (ipp->loc[2] >= 0)
+         glUniform4fv(ipp->loc[2], 1, v + 8);
+   }
+}
+
+void gl_glsl_in_place_end(void *shader_data)
+{
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)shader_data;
+   if (glsl && glsl->in_place.swapped)
+      gl_glsl_in_place_swap(glsl);
+}
+
+static void gl_glsl_viewer_free(glsl_shader_data_t *glsl)
+{
+   unsigned i;
+   for (i = 0; i < glsl->viewer.count; i++)
+      if (glsl->viewer.pass[i].prg.id)
+         glDeleteProgram(glsl->viewer.pass[i].prg.id);
+   free(glsl->viewer.pass);
+   memset(&glsl->viewer, 0, sizeof(glsl->viewer));
+   memset(glsl->viewer_pass, 0, sizeof(glsl->viewer_pass));
+   glsl->viewer_active = false;
+}
+
+/* Reflect the programs which were actually linked: inactive stage samplers
+ * need no rewrite. History, unlike pass output and LUTs, holds raw frames. */
+static int gl_glsl_viewer_names(const glsl_shader_data_t *glsl,
+      unsigned p, char (*names)[64], unsigned cap)
+{
+   GLint i, count = 0;
+   int num = 0;
+   glGetProgramiv(glsl->prg[p].id, GL_ACTIVE_UNIFORMS, &count);
+   for (i = 0; i < count; i++)
+   {
+      char name[64], *bracket;
+      GLint size = 0, location;
+      GLsizei length = 0;
+      GLenum type = 0;
+      unsigned j;
+      int kind;
+      glGetActiveUniform(glsl->prg[p].id, (GLuint)i, sizeof(name),
+            &length, &size, &type, name);
+      if (type != GL_SAMPLER_2D) continue;
+      if (length >= (GLsizei)sizeof(name) - 1) return -1;
+      location = glGetUniformLocation(glsl->prg[p].id, name);
+      if ((bracket = strchr(name, '['))) *bracket = '\0';
+      kind = gl_glsl_in_place_sampler(glsl, p, name);
+      for (j = 0; j < PREV_TEXTURES; j++)
+         if (location >= 0 && location == glsl->uniforms[p].prev[j].texture)
+            kind = 1;
+      if (kind < 0) return -1;
+      if (kind)
+      {
+         if ((unsigned)num == cap) return -1;
+         strlcpy(names[num++], name, sizeof(names[0]));
+      }
+   }
+   return num;
+}
+
+static void gl_glsl_viewer_prepare(glsl_shader_data_t *glsl)
+{
+   struct glsl_in_place *viewer = &glsl->viewer;
+   unsigned p, passes = glsl->shader->passes;
+   gl_glsl_viewer_free(glsl);
+   if (!passes || passes + 1 >= GFX_MAX_SHADERS
+         || !(viewer->pass = (struct glsl_in_place_pass*)
+            calloc(passes, sizeof(*viewer->pass)))) return;
+   for (p = 1; p <= passes; p++)
+   {
+      GLint count = 0;
+      char (*names)[64];
+      const char **list;
+      struct shader_program_info info;
+      struct glsl_in_place_pass *pass = &viewer->pass[viewer->count];
+      char *vertex = NULL, *fragment = NULL;
+      bool vertex_changed = false, fragment_changed = false, made = false;
+      int i, num;
+      glGetProgramiv(glsl->prg[p].id, GL_ACTIVE_UNIFORMS, &count);
+      if (count < 0 || (size_t)count > (size_t)-1 / sizeof(*names)
+            || (size_t)count > (size_t)-1 / sizeof(*list)) goto fail;
+      if (!count) continue;
+      names = (char (*)[64])calloc((size_t)count, sizeof(*names));
+      list = (const char**)calloc((size_t)count, sizeof(*list));
+      if (!names || !list) { free(names); free(list); goto fail; }
+      num = gl_glsl_viewer_names(glsl, p, names, (unsigned)count);
+      for (i = 0; i < num; i++) list[i] = names[i];
+      if (num > 0)
+      {
+         vertex = glsl_colour_rewrite(glsl->shader->pass[p - 1].source.string.vertex,
+               list, (unsigned)num, &vertex_changed);
+         fragment = glsl_colour_rewrite(glsl->shader->pass[p - 1].source.string.fragment,
+               list, (unsigned)num, &fragment_changed);
+      }
+      free(names);
+      free(list);
+      if (!num) continue;
+      if (vertex && fragment)
+      {
+         if (!vertex_changed && !fragment_changed)
+         {
+            free(vertex);
+            free(fragment);
+            continue;
+         }
+         info.vertex = vertex;
+         info.fragment = fragment;
+         info.is_file = false;
+         glsl->quiet = true;
+         made = gl_glsl_compile_program(glsl, p, &pass->prg, &info);
+         glsl->quiet = false;
+      }
+      free(vertex);
+      free(fragment);
+      if (!made) goto fail;
+      viewer->count++;
+      pass->idx = p;
+      glsl->viewer_pass[p] = pass;
+      gl_glsl_find_uniforms(glsl, p, pass->prg.id, &pass->uni);
+      pass->loc[0] = glGetUniformLocation(pass->prg.id, GLSL_COLOUR_ROW0);
+      pass->loc[1] = glGetUniformLocation(pass->prg.id, GLSL_COLOUR_ROW1);
+      pass->loc[2] = glGetUniformLocation(pass->prg.id, GLSL_COLOUR_ROW2);
+   }
+   viewer->ok = true;
+   return;
+fail:
+   /* Unsupported sampling keeps the correctly coloured plain viewer. */
+   gl_glsl_viewer_free(glsl);
+}
+
+static bool gl_glsl_set_media_colour(void *data, const float *rows)
+{
+   glsl_shader_data_t *glsl = (glsl_shader_data_t*)data;
+   struct glsl_in_place *viewer = &glsl->viewer;
+   unsigned i, j;
+   if (rows && (!viewer->ok || glsl->in_place.swapped)) return false;
+   if ((rows != NULL) != glsl->viewer_active)
+   {
+      for (i = 0; i < viewer->count; i++)
+         glsl->current_mat_data_pointer[viewer->pass[i].idx] = NULL;
+      glsl->viewer_active = rows != NULL;
+   }
+   if (rows)
+      for (i = 0; i < viewer->count; i++)
+      {
+         const struct glsl_in_place_pass *pass = &viewer->pass[i];
+         glUseProgram(pass->prg.id);
+         for (j = 0; j < 3; j++)
+            if (pass->loc[j] >= 0) glUniform4fv(pass->loc[j], 1, rows + j * 4);
+      }
+   return true;
+}
+
+static void gl_glsl_set_media_source(void *data, unsigned dims)
+{
+   ((glsl_shader_data_t*)data)->media_source_dims = dims;
+}
+
+const shader_backend_t gl_glsl_backend = {
+   gl_glsl_init,
+   gl_glsl_deinit,
+   gl_glsl_set_params,
+   gl_glsl_set_uniform_parameter,
+   gl_glsl_compile_program,
+   gl_glsl_use,
+   gl_glsl_num,
+   gl_glsl_filter_type,
+   gl_glsl_wrap_type,
+   gl_glsl_shader_scale,
+   gl_glsl_set_coords,
+   gl_glsl_set_mvp,
+   gl_glsl_get_prev_textures,
+   gl_glsl_get_feedback_pass,
+   gl_glsl_mipmap_input,
+   gl_glsl_get_current_shader,
+   gl_glsl_get_flags,
+
+   RARCH_SHADER_GLSL,
+   "glsl",
+   gl_glsl_set_media_source,
+   gl_glsl_set_media_colour
+};

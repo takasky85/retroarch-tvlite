@@ -1,0 +1,198 @@
+/*  RetroArch - A frontend for libretro.
+ *  Copyright (C) 2010-2014 - Hans-Kristian Arntzen
+ *  Copyright (C) 2011-2017 - Daniel De Matteis
+ *
+ *  RetroArch is free software: you can redistribute it and/or modify it under the terms
+ *  of the GNU General Public License as published by the Free Software Found-
+ *  ation, either version 3 of the License, or (at your option) any later version.
+ *
+ *  RetroArch is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+ *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ *  PURPOSE.  See the GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License along with RetroArch.
+ *  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#ifndef X11_COMMON_H__
+#define X11_COMMON_H__
+
+#include <X11/Xutil.h>
+
+#include <boolean.h>
+#include <retro_atomic.h>
+#include <retro_inline.h>
+
+#include "../../retroarch.h"
+#include "../video_windows.h"
+
+extern Window   g_x11_win;
+extern Display *g_x11_dpy;
+extern Colormap g_x11_cmap;
+extern unsigned g_x11_screen;
+
+extern const unsigned long x11_retroarch_icon[];
+extern const size_t x11_retroarch_icon_len;
+
+/* The refresh rate the X display server read through g_x11_dpy, kept
+ * until the display changes. The display server selects RandR screen,
+ * crtc and output changes on the root window and publishes the
+ * extension's event base in g_x11_randr_state; the event pump marks it
+ * X11_RANDR_PUMPED the first time it drains that connection, and only
+ * from then on is the rate kept, since only then does a change reach
+ * it. The rate is the bits of a float, or X11_REFRESH_NONE. Stored in
+ * dispserv_x11.c. */
+#define X11_RANDR_BASE_MASK   0xff
+#define X11_RANDR_PUMPED      0x100
+#define X11_RANDR_UNAVAILABLE 0x200
+#define X11_REFRESH_NONE      (-1)
+
+extern retro_atomic_int_t g_x11_randr_state;
+extern retro_atomic_int_t g_x11_refresh_serial;
+extern retro_atomic_int_t g_x11_refresh_bits;
+
+/* The change is counted before the kept rate is dropped: a reader that
+ * read the old mode keeps its rate only if the count did not move. */
+static INLINE void x11_refresh_invalidate(void)
+{
+   retro_atomic_inc_int(&g_x11_refresh_serial);
+   retro_atomic_store_release_int(&g_x11_refresh_bits, X11_REFRESH_NONE);
+}
+
+void x11_show_mouse(void *data, bool state);
+void x11_set_net_wm_fullscreen(Display *dpy, Window win);
+void x11_set_net_wm_fullscreen_hint(Display *dpy, Window win);
+bool x11_suspend_screensaver(void *data, bool enable);
+
+void x11_move_window(Display *dpy, Window win,
+      int x, int y, unsigned width, unsigned height);
+
+/* Set icon, class, default stuff. */
+void x11_set_window_attr(Display *dpy, Window win);
+
+
+#ifdef HAVE_XF86VM
+float x11_get_refresh_rate(void *data);
+
+bool x11_enter_fullscreen(Display *dpy, unsigned width, unsigned height);
+
+void x11_exit_fullscreen(Display *dpy);
+#endif
+
+void x11_check_window(void *data, bool *quit,
+   bool *resize, unsigned *dims);
+
+void x11_get_video_size(void *data, unsigned *dims);
+
+bool x11_has_focus(void *data);
+
+bool x11_has_focus_internal(void *data);
+
+/* False while the window is unmapped; see gfx_ctx_driver_t::presentable. */
+bool x11_presentable(void *data);
+
+/* Whether what the window presents goes past a compositor: it asked
+ * to bypass one (@bypass), or none runs on its screen. Asks the
+ * server; for when the window is made. */
+bool x11_window_uncomposed(bool bypass);
+
+bool x11_alive(void *data);
+
+bool x11_connect(void);
+
+void x11_update_title(void *data);
+
+bool x11_input_ctx_new(bool true_full);
+
+void x11_input_ctx_destroy(void);
+
+void x11_window_destroy(bool fullscreen);
+
+void x11_colormap_destroy(void);
+
+void x11_install_quit_atom(void);
+
+void x11_event_queue_check(XEvent *event);
+
+char *x11_get_wm_name(Display *dpy);
+
+bool x11_has_net_wm_fullscreen(Display *dpy);
+
+#ifdef HAVE_VIDEO_WINDOWS
+/* A secondary screen's window on g_x11_dpy, window->state from create
+ * to destroy. Its events arrive through x11_alive(); everything here
+ * belongs to the thread that runs the context. */
+typedef struct x11_video_window
+{
+   video_window_common_t common;
+   /* When the event that asked for the root position was taken */
+   retro_time_t translate_at;
+   /* When the event of judge_pos and judge_dims was taken */
+   retro_time_t judge_at;
+   /* The context's GL drawable for the window, if it has one */
+   void *drawable;
+   Window handle;
+   Colormap colormap;
+   /* The request asking for the root position, 0 for none */
+   unsigned translate;
+   /* The request reading _NET_WM_STATE, 0 for none */
+   unsigned wm_state;
+   /* The _NET_WM_STATE read the bounds to judge wait for, 0 for none */
+   unsigned judge_read;
+   /* The wm_state read out when they came, 0 for none */
+   unsigned judge_state;
+   /* Bounds the next poll() judges, where 'judge' */
+   unsigned judge_pos;
+   unsigned judge_dims;
+   /* Where it stood before it last went fullscreen, 0 dims for never */
+   unsigned windowed_pos;
+   unsigned windowed_dims;
+   bool translate_again;
+   bool wm_state_again;
+   /* Not fullscreen, maximised or minimised, as last read */
+   bool wm_normal;
+   bool judge;
+   /* Whether they were normal at the first poll() after them */
+   bool judge_normal;
+   /* The context has set its drawable's swap interval */
+   bool interval_set;
+   bool reparented;
+   bool destroyed;
+   /* Made with it, which a context that takes it must have */
+   VisualID visual;
+} x11_video_window_t;
+
+/* The window comes unmapped, for the context to make its drawable on
+ * with the same visual; x11_video_window_show() then maps it. A
+ * drawable that is a server resource of its own is named as 'resource'
+ * so its errors are the window's too. */
+bool x11_video_window_create(void *owner,
+      const video_window_request_t *request,
+      video_window_native_t *window, Visual *visual, int depth);
+void x11_video_window_show(video_window_native_t *window,
+      void *drawable, XID resource);
+void x11_video_window_update(void *owner, video_window_native_t *window,
+      const video_window_request_t *request);
+unsigned x11_video_window_poll(void *owner, video_window_event_t *events,
+      unsigned capacity);
+void x11_video_window_destroy(void *owner, video_window_native_t *window);
+/* Hands each window 'owner' still has to 'destroy'; kept ones stay
+ * for the next driver's start. */
+void x11_video_windows_free(void *owner,
+      void (*destroy)(void *owner, video_window_native_t *window));
+/* Leaves the window up, untouched, for the next context; the context
+ * has let go of its drawable */
+void x11_video_window_keep(void *owner, video_window_native_t *window);
+/* Adopts screen 'screen's kept window where it is on 'visual'; one on
+ * another goes. The context then puts its drawable on it. */
+bool x11_video_window_take(void *owner, unsigned screen,
+      video_window_native_t *window, unsigned *display, VisualID visual);
+/* Once its drawable is on it: the focus back, if it had it at keep */
+void x11_video_window_taken(video_window_native_t *window);
+void x11_video_window_drawable(video_window_native_t *window,
+      void *drawable, XID resource);
+/* Kept windows nobody took go; on the thread of the context */
+void x11_video_windows_release_kept(void);
+#endif
+
+#endif

@@ -1,0 +1,1480 @@
+/*  RetroArch - A frontend for libretro.
+ *
+ *  RetroArch is free software: you can redistribute it and/or modify it under the terms
+ *  of the GNU General Public License as published by the Free Software Found-
+ *  ation, either version 3 of the License, or (at your option) any later version.
+ *
+ *  RetroArch is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+ *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ *  PURPOSE.  See the GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License along with RetroArch.
+ *  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <compat/strl.h>
+#include <encodings/base64.h>
+#include <features/features_cpu.h>
+#include <lists/string_list.h>
+#include <lrc_hash.h>
+#include <net/net_http.h>
+#include <time/rtime.h>
+#include <string/stdstring.h>
+#ifdef HAVE_CRYPTO
+#include <crypto/kdf.h>
+#endif
+
+#include "../cloud_sync_driver.h"
+#include "../../retroarch.h"
+#include "../../tasks/tasks_internal.h"
+#include "../../tasks/task_file_transfer.h"
+#include "../../verbosity.h"
+
+typedef struct
+{
+   char path[PATH_MAX_LENGTH];
+   char file[PATH_MAX_LENGTH];
+   cloud_sync_complete_handler_t cb;
+   void *user_data;
+   RFILE *rfile;
+   /* Set once this request has been retried with fresh credentials;
+    * see webdav_retry_auth(). */
+   bool reauthed;
+} webdav_cb_state_t;
+
+typedef void (*webdav_mkdir_cb_t)(bool success, webdav_cb_state_t *state);
+
+typedef struct
+{
+   char url[PATH_MAX_LENGTH];
+   char *last_slash;
+   char post_slash;
+   webdav_mkdir_cb_t cb;
+   webdav_cb_state_t *cb_st;
+   bool reauthed;
+} webdav_mkdir_state_t;
+
+/* TODO: all of this HTTP auth stuff should
+ * probably live in libretro-common/net? */
+typedef struct
+{
+   char url[PATH_MAX_LENGTH];
+
+   /* Collections this sync has already created on the server. */
+   struct string_list *dirs;
+
+   bool basic;
+   char *basic_auth_header;
+   /* The last Digest header built; reused, grown only when too small */
+   char *digest_header;
+   size_t digest_header_cap;
+
+   char *username;
+   char *ha1hash;
+   char *realm;
+   char *nonce;
+   char *algo;
+   char *opaque;
+   unsigned nc;
+   char cnonce[33];
+   bool qop_auth;
+   bool dav_verified;
+} webdav_state_t;
+
+static webdav_state_t webdav_driver_st;
+
+webdav_state_t *webdav_state_get_ptr(void)
+{
+   return &webdav_driver_st;
+}
+
+/* Encode the configured collection URL and the file path separately.
+ * A '#' in a save filename must be sent as %23, not as a URL fragment. */
+static bool webdav_url_for_path(char *url, size_t len, const char *path,
+      size_t *base_len)
+{
+   size_t _len;
+
+   /* Both encoded straight into @url */
+   net_http_urlencode_full(url, webdav_state_get_ptr()->url, len);
+   if ((_len = strlen(url)) + 1 >= len)
+      return false;
+   if (base_len)
+      *base_len = _len;
+   if (_len && url[_len - 1] != '/')
+   {
+      url[_len++] = '/';
+      url[_len]   = '\0';
+   }
+   return net_http_urlencode_to(url + _len, len - _len, path) < len - _len;
+}
+
+static char *webdav_create_basic_auth(void)
+{
+   static const char prefix[] = "Authorization: Basic ";
+   int         flen;
+   int         plain_len;
+   char       *base64auth;
+   char       *header;
+   char        userpass[sizeof(((settings_t*)0)->arrays.webdav_username)
+                       + sizeof(((settings_t*)0)->arrays.webdav_password)];
+   size_t      header_len;
+   size_t      prefix_len = sizeof(prefix) - 1;
+   settings_t *settings = config_get_ptr();
+
+   plain_len = snprintf(userpass, sizeof(userpass), "%s:%s",
+         settings->arrays.webdav_username,
+         settings->arrays.webdav_password);
+   if (plain_len < 0 || (size_t)plain_len >= sizeof(userpass))
+      return NULL;
+
+   base64auth = base64(userpass, plain_len, &flen);
+   if (!base64auth)
+      return NULL;
+
+   header_len = prefix_len + (size_t)flen;
+   header     = (char*)malloc(header_len + 3);
+   if (!header)
+   {
+      free(base64auth);
+      return NULL;
+   }
+
+   memcpy(header, prefix, prefix_len);
+   memcpy(header + prefix_len, base64auth, (size_t)flen);
+   free(base64auth);
+   header[header_len++] = '\r';
+   header[header_len++] = '\n';
+   header[header_len]   = '\0';
+   return header;
+}
+
+static void webdav_cleanup_digest(void)
+{
+   webdav_state_t *webdav_st = webdav_state_get_ptr();
+
+   if (webdav_st->ha1hash)
+      free(webdav_st->ha1hash);
+   webdav_st->ha1hash = NULL;
+
+   if (webdav_st->realm)
+      free(webdav_st->realm);
+   webdav_st->realm = NULL;
+
+   if (webdav_st->nonce)
+      free(webdav_st->nonce);
+   webdav_st->nonce = NULL;
+
+   if (webdav_st->algo)
+      free(webdav_st->algo);
+   webdav_st->algo = NULL;
+
+   if (webdav_st->opaque)
+      free(webdav_st->opaque);
+   webdav_st->opaque = NULL;
+
+   webdav_st->cnonce[0] = '\0';
+
+   free(webdav_st->digest_header);
+   webdav_st->digest_header     = NULL;
+   webdav_st->digest_header_cap = 0;
+
+   webdav_st->qop_auth = false;
+   webdav_st->nc = 1;
+}
+
+/* A new client nonce for each challenge, as 32 hex digits. The cnonce
+ * is the client's own input to the digest: with a fixed one, a hostile
+ * server (or anyone in the middle of plain HTTP) picks every other input
+ * and can test password guesses against tables computed in advance.
+ * From the platform entropy source where the crypto library has one,
+ * otherwise from the microsecond clock and a counter, which still
+ * differs per challenge but is not unpredictable. */
+static void webdav_create_cnonce(char *out)
+{
+   static unsigned counter = 0;
+   unsigned char   bytes[16];
+   size_t          i;
+#ifdef HAVE_CRYPTO
+   if (crypto_random_bytes(bytes, sizeof(bytes)) != 0)
+#endif
+   {
+      MD5_CTX  md5;
+      retro_time_t now = cpu_features_get_time_usec();
+      counter++;
+      MD5_Init(&md5);
+      MD5_Update(&md5, &now, sizeof(now));
+      MD5_Update(&md5, &counter, sizeof(counter));
+      MD5_Final(bytes, &md5);
+   }
+   for (i = 0; i < sizeof(bytes); i++)
+      snprintf(out + i * 2, 3, "%02x", bytes[i]);
+}
+
+/* @md5 finished, as 32 lowercase hex digits and a NUL in @out. */
+static void webdav_md5_hex(MD5_CTX *md5, char *out)
+{
+   static const char hex[] = "0123456789abcdef";
+   unsigned char     digest[16];
+   unsigned          i;
+
+   MD5_Final(digest, md5);
+   for (i = 0; i < 16; i++)
+   {
+      out[i * 2]     = hex[digest[i] >> 4];
+      out[i * 2 + 1] = hex[digest[i] & 15];
+   }
+   out[32] = '\0';
+}
+
+static char *webdav_create_ha1_hash(char *user, char *realm, char *pass)
+{
+   MD5_CTX md5;
+   char *hash = (char*)malloc(33);
+
+   if (!hash)
+      return NULL;
+
+   MD5_Init(&md5);
+   MD5_Update(&md5, user, (unsigned long)strlen(user));
+   MD5_Update(&md5, ":", 1);
+   MD5_Update(&md5, realm, (unsigned long)strlen(realm));
+   MD5_Update(&md5, ":", 1);
+   MD5_Update(&md5, pass, (unsigned long)strlen(pass));
+   webdav_md5_hex(&md5, hash);
+
+   return hash;
+}
+
+/* The quoted value starting at @p (just past its opening quote), as a
+ * new string replacing *@out.  Returns the position after the closing
+ * quote, or NULL when there is no closing quote or no memory. */
+static const char *webdav_digest_quoted(const char *p, char **out)
+{
+   const char *q = strchr(p, '"');
+   size_t      n;
+   char       *v;
+
+   if (!q)
+      return NULL;
+   n = (size_t)(q - p);
+   if (!(v = (char*)malloc(n + 1)))
+      return NULL;
+   memcpy(v, p, n);
+   v[n] = '\0';
+   free(*out);
+   *out = v;
+   return q + 1;
+}
+
+/* Parse a "WWW-Authenticate: Digest ..." challenge into webdav_st.  The
+ * challenge comes from the server, so every scan is bounded by the end
+ * of the line: a value with no closing quote used to reach strchr() ==
+ * NULL and crash on the length computed from it, and an unknown
+ * unquoted parameter at the end of the line was skipped by a loop that
+ * never looked for the terminator and read on past it. */
+static bool webdav_create_digest_auth(const char *digest)
+{
+   webdav_state_t *webdav_st = webdav_state_get_ptr();
+   settings_t     *settings  = config_get_ptr();
+   const char     *ptr       = digest + (sizeof("WWW-Authenticate: Digest")-1);
+
+   if (   !*settings->arrays.webdav_username
+       && !*settings->arrays.webdav_password)
+      return false;
+
+   webdav_cleanup_digest();
+
+   webdav_st->username = settings->arrays.webdav_username;
+
+   for (;;)
+   {
+      while (*ptr == ' ' || *ptr == '\t' || *ptr == '\r' || *ptr == '\n' || *ptr == ',')
+         ++ptr;
+
+      if (!*ptr)
+         break;
+
+      if (string_starts_with(ptr, "realm=\""))
+      {
+         if (!(ptr = webdav_digest_quoted(ptr + STRLEN_CONST("realm=\""),
+                     &webdav_st->realm)))
+            return false;
+         free(webdav_st->ha1hash);
+         webdav_st->ha1hash = webdav_create_ha1_hash(
+               webdav_st->username, webdav_st->realm,
+               settings->arrays.webdav_password);
+      }
+      else if (string_starts_with(ptr, "qop=\""))
+      {
+         const char *tail;
+         ptr += STRLEN_CONST("qop=\"");
+         if (!(tail = strchr(ptr, '"')))
+            return false;
+         /* Any member of the list equal to "auth". */
+         while (ptr < tail)
+         {
+            const char *e = ptr;
+            while (e < tail && *e != ',')
+               e++;
+            while (ptr < e && (*ptr == ' ' || *ptr == '\t'))
+               ptr++;
+            if (e - ptr == 4 && !strncmp(ptr, "auth", 4))
+               webdav_st->qop_auth = true;
+            ptr = (e < tail) ? e + 1 : e;
+         }
+         /* not even going to try for auth-int, sorry */
+         if (!webdav_st->qop_auth)
+            return false;
+         ptr = tail + 1;
+      }
+      else if (string_starts_with(ptr, "nonce=\""))
+      {
+         if (!(ptr = webdav_digest_quoted(ptr + STRLEN_CONST("nonce=\""),
+                     &webdav_st->nonce)))
+            return false;
+      }
+      else if (string_starts_with(ptr, "opaque=\""))
+      {
+         if (!(ptr = webdav_digest_quoted(ptr + STRLEN_CONST("opaque=\""),
+                     &webdav_st->opaque)))
+            return false;
+      }
+      else if (string_starts_with(ptr, "algorithm=\""))
+      {
+         if (!(ptr = webdav_digest_quoted(ptr + STRLEN_CONST("algorithm=\""),
+                     &webdav_st->algo)))
+            return false;
+      }
+      else if (string_starts_with(ptr, "algorithm="))
+      {
+         const char *e;
+         size_t      n;
+         ptr += STRLEN_CONST("algorithm=");
+         for (e = ptr; *e && *e != ','; e++) { }
+         n = (size_t)(e - ptr);
+         free(webdav_st->algo);
+         if (!(webdav_st->algo = (char*)malloc(n + 1)))
+            return false;
+         memcpy(webdav_st->algo, ptr, n);
+         webdav_st->algo[n] = '\0';
+         ptr = e;
+      }
+      else
+      {
+         /* Unknown parameter: name=value or name="value", skipped. */
+         while (*ptr && *ptr != '=' && *ptr != ',')
+            ptr++;
+         if (*ptr == '=')
+         {
+            ptr++;
+            if (*ptr == '"')
+            {
+               if (!(ptr = strchr(ptr + 1, '"')))
+                  return false;
+               ptr++;
+            }
+            else
+               while (*ptr && *ptr != ',')
+                  ptr++;
+         }
+      }
+   }
+
+   if (!webdav_st->ha1hash || !webdav_st->nonce)
+      return false;
+
+   webdav_create_cnonce(webdav_st->cnonce);
+   webdav_st->basic = false;
+
+   return true;
+}
+
+static void webdav_create_ha1(char *out)
+{
+   MD5_CTX         md5;
+   webdav_state_t *webdav_st = webdav_state_get_ptr();
+
+   if (!string_is_equal(webdav_st->algo, "MD5-sess"))
+   {
+      memcpy(out, webdav_st->ha1hash, 33);
+      return;
+   }
+
+   MD5_Init(&md5);
+   MD5_Update(&md5, webdav_st->ha1hash, 32);
+   MD5_Update(&md5, ":", 1);
+   MD5_Update(&md5, webdav_st->nonce, (unsigned long)strlen(webdav_st->nonce));
+   MD5_Update(&md5, ":", 1);
+   MD5_Update(&md5, webdav_st->cnonce, (unsigned long)strlen(webdav_st->cnonce));
+   webdav_md5_hex(&md5, out);
+}
+
+static void webdav_create_ha2(const char *method, const char *path,
+      char *out)
+{
+   MD5_CTX md5;
+
+   /* no attempt at supporting auth-int, everything else uses this */
+   MD5_Init(&md5);
+   MD5_Update(&md5, method, (unsigned long)strlen(method));
+   MD5_Update(&md5, ":", 1);
+   MD5_Update(&md5, path, (unsigned long)strlen(path));
+   webdav_md5_hex(&md5, out);
+}
+
+static void webdav_create_digest_response(const char *method,
+      const char *path, char *out)
+{
+   MD5_CTX         md5;
+   char            ha1[33];
+   char            ha2[33];
+   webdav_state_t *webdav_st = webdav_state_get_ptr();
+
+   webdav_create_ha1(ha1);
+   webdav_create_ha2(method, path, ha2);
+
+   MD5_Init(&md5);
+   MD5_Update(&md5, ha1, 32);
+   MD5_Update(&md5, ":", 1);
+   MD5_Update(&md5, webdav_st->nonce, (unsigned long)strlen(webdav_st->nonce));
+   if (webdav_st->qop_auth)
+   {
+      char nonceCount[10];
+      snprintf(nonceCount, sizeof(nonceCount), "%08x", webdav_st->nc);
+      MD5_Update(&md5, ":", 1);
+      MD5_Update(&md5, nonceCount, (unsigned long)strlen(nonceCount));
+      MD5_Update(&md5, ":", 1);
+      MD5_Update(&md5, webdav_st->cnonce, (unsigned long)strlen(webdav_st->cnonce));
+      MD5_Update(&md5, ":", 1);
+      MD5_Update(&md5, "auth", (sizeof("auth")-1));
+   }
+   MD5_Update(&md5, ":", 1);
+   MD5_Update(&md5, ha2, 32);
+   webdav_md5_hex(&md5, out);
+}
+
+/* Built in webdav_st->digest_header, valid until the next call */
+static const char *webdav_create_digest_auth_header(const char *method,
+      const char *url)
+{
+   size_t _len, __len;
+   char nonceCount[10];
+   char response[33];
+   webdav_state_t *webdav_st = webdav_state_get_ptr();
+   char           *header    = NULL;
+   const char     *path      = url;
+   int             count     = 0;
+   size_t          total     = 0;
+
+   /* The cnonce is written only once a challenge has been accepted.  A
+    * rejected one leaves it empty, with realm and nonce possibly NULL,
+    * and basic auth stays off once any challenge has been accepted. */
+   if (!webdav_st->cnonce[0])
+      return NULL;
+
+   /* Skip scheme and host to get at the path.  strchr() returns NULL
+    * once the slashes run out, which happens for a URL that is only a
+    * scheme, so check before stepping past it again. */
+   do
+   {
+      path++;
+      if (!(path = strchr(path, '/')))
+         return NULL;
+      count++;
+   } while (count < 3);
+
+   webdav_create_digest_response(method, path, response);
+   __len    = snprintf(nonceCount, sizeof(nonceCount),
+         "%08x", webdav_st->nc++);
+
+   _len  = STRLEN_CONST("Authorization: Digest ");
+   _len += STRLEN_CONST("username=\"") + strlen(webdav_st->username) + STRLEN_CONST("\", ");
+   _len += STRLEN_CONST("realm=\"")    + strlen(webdav_st->realm) + STRLEN_CONST("\", ");
+   _len += STRLEN_CONST("nonce=\"")    + strlen(webdav_st->nonce) + STRLEN_CONST("\", ");
+   _len += STRLEN_CONST("uri=\"")      + strlen(path) + STRLEN_CONST("\", ");
+   _len += STRLEN_CONST("nc=\"")       + __len + STRLEN_CONST("\", ");
+   _len += STRLEN_CONST("cnonce=\"")   + strlen(webdav_st->cnonce) + STRLEN_CONST("\", ");
+   if (webdav_st->qop_auth)
+      _len += STRLEN_CONST("qop=\"auth\", ");
+   if (webdav_st->opaque)
+      _len += STRLEN_CONST("opaque=\"") + strlen(webdav_st->opaque) + STRLEN_CONST("\", ");
+   _len += STRLEN_CONST("response=\"")  + 32 + STRLEN_CONST("\"\r\n");
+   _len += 1;
+
+   total  = _len;
+   _len   = 0;
+   if (total > webdav_st->digest_header_cap)
+   {
+      if (!(header = (char*)realloc(webdav_st->digest_header, total)))
+         return NULL;
+      webdav_st->digest_header     = header;
+      webdav_st->digest_header_cap = total;
+   }
+   header = webdav_st->digest_header;
+   _len   = strlcpy_lit(header, "Authorization: Digest username=\"", total - _len);
+   _len  += strlcpy(header + _len, webdav_st->username, total - _len);
+   _len  += strlcpy_lit(header + _len, "\", realm=\"", total - _len);
+   _len  += strlcpy(header + _len, webdav_st->realm, total - _len);
+   _len  += strlcpy_lit(header + _len, "\", nonce=\"", total - _len);
+   _len  += strlcpy(header + _len, webdav_st->nonce, total - _len);
+   _len  += strlcpy_lit(header + _len, "\", uri=\"", total - _len);
+   _len  += strlcpy(header + _len, path, total - _len);
+   _len  += strlcpy_lit(header + _len, "\", nc=\"", total - _len);
+   _len  += strlcpy(header + _len, nonceCount, total - _len);
+   _len  += strlcpy_lit(header + _len, "\", cnonce=\"", total - _len);
+   _len  += strlcpy(header + _len, webdav_st->cnonce, total - _len);
+   if (webdav_st->qop_auth)
+      _len += strlcpy_lit(header + _len, "\", qop=\"auth", total - _len);
+   if (webdav_st->opaque)
+   {
+      _len += strlcpy_lit(header + _len, "\", opaque=\"", total - _len);
+      _len += strlcpy(header + _len, webdav_st->opaque, total - _len);
+   }
+   _len += strlcpy_lit(header + _len, "\", response=\"", total - _len);
+   _len += strlcpy(header + _len, response, total - _len);
+   strlcpy_lit(header + _len, "\"\r\n", total - _len);
+   return header;
+}
+
+/* Borrowed: valid until the next call or the end of the sync */
+static const char *webdav_get_auth_header(const char *method,
+      const char *url)
+{
+   webdav_state_t *webdav_st = webdav_state_get_ptr();
+   settings_t     *settings  = config_get_ptr();
+
+   if (   !*settings->arrays.webdav_username
+       && !*settings->arrays.webdav_password)
+      return NULL;
+
+   if (webdav_st->basic)
+   {
+      if (!webdav_st->basic_auth_header)
+         webdav_st->basic_auth_header = webdav_create_basic_auth();
+      return webdav_st->basic_auth_header;
+   }
+
+   return webdav_create_digest_auth_header(method, url);
+}
+
+static void webdav_log_http_failure(const char *path,
+      http_transfer_data_t *data, const char *err)
+{
+    const char *h;
+    size_t _len = 0;
+    /* Cloud sync runs several transfers at once, so one RARCH_WARN per
+     * header interleaves with the other tasks' output and produces logs
+     * with lines spliced into each other.  Build the whole report first
+     * and emit it in a single write. */
+    char report[2048];
+
+    _len  = snprintf(report, sizeof(report), "[webdav] Failed: %s: HTTP %d",
+          path, data->status);
+    /* No status means the transport failed before the server answered;
+     * the task's error names the stage (and the TLS code, if any),
+     * which is the only clue a log on a console will carry. */
+    if (data->status < 0 && err && *err && _len < sizeof(report) - 1)
+       _len += snprintf(report + _len, sizeof(report) - _len, " (%s)", err);
+    for (h = net_http_header_next(data->headers, NULL); h;
+          h = net_http_header_next(data->headers, h))
+    {
+       if (_len >= sizeof(report) - 1)
+          break;
+       report[_len++] = '\n';
+       _len += strlcpy(report + _len, h, sizeof(report) - _len);
+    }
+    RARCH_WARN("%s\n", report);
+    /* The buffer returned by net_http_data() is sized exactly to
+     * data->len -- net_http.c shrinks response->data with
+     * realloc(p, response->len) on transition to P_DONE.  Writing a
+     * NUL at data->data[data->len] is therefore a one-byte heap
+     * overflow that corrupts the next chunk's metadata; glibc later
+     * aborts in malloc_printerr from an unrelated free() (typically
+     * the next task_http_transfer_cleanup at startup when cloud
+     * sync issues many requests in quick succession).  Print with
+     * an explicit length instead of relying on NUL-termination. */
+    if (data->data)
+        RARCH_WARN("%.*s\n", (int)data->len, (const char*)data->data);
+}
+
+static bool webdav_needs_reauth(http_transfer_data_t *data)
+{
+   const char *h;
+
+   if (!data || data->status != 401 || !data->headers)
+      return false;
+
+   for (h = net_http_header_next(data->headers, NULL); h;
+         h = net_http_header_next(data->headers, h))
+   {
+      /* Header names are case-insensitive (RFC 9110 5.1), and the
+       * emscripten backend gets them from the browser, which
+       * lower-cases them.  The offset skipped by
+       * webdav_create_digest_auth() below is a fixed length, so
+       * matching case-insensitively here stays correct. */
+      if (!string_starts_with_case_insensitive(h,
+               "WWW-Authenticate: Digest "))
+         continue;
+
+      RARCH_DBG("[webdav] Found WWW-Authenticate: Digest header\n");
+      if (webdav_create_digest_auth(h))
+         return true;
+      RARCH_WARN("[webdav] Failure creating WWW-Authenticate: Digest header\n");
+   }
+
+   return false;
+}
+
+/* Whether to retry a request the server answered with a Digest
+ * challenge.  One retry per request: that covers a stale nonce and a
+ * request that met the challenge first.  A second challenge means the
+ * server rejected the credentials themselves, and retrying again would
+ * only meet it again - with a wrong password the server answers every
+ * attempt that way, which used to loop the request forever. */
+static bool webdav_retry_auth(http_transfer_data_t *data, bool *reauthed)
+{
+   if (!webdav_needs_reauth(data))
+      return false;
+   if (*reauthed)
+   {
+      RARCH_ERR("[webdav] The server rejected the credentials. Check the WebDAV username and password.\n");
+      return false;
+   }
+   *reauthed = true;
+   return true;
+}
+
+/* RFC 9110 5.6.1.2: the Allow header is a comma-separated list of
+ * method tokens describing what the *target resource* supports. Match
+ * whole tokens so that a method merely containing another's name
+ * cannot be mistaken for it. */
+static bool webdav_allow_lists_method(const char *allow, const char *method)
+{
+   const char *p = allow;
+   size_t _len   = strlen(method);
+
+   while (*p)
+   {
+      const char *tok;
+
+      while (*p == ' ' || *p == '\t' || *p == ',')
+         p++;
+      tok = p;
+      while (*p && *p != ',' && *p != ' ' && *p != '\t')
+         p++;
+      if (     (size_t)(p - tok) == _len
+            && string_starts_with_case_insensitive(tok, method))
+         return true;
+   }
+
+   return false;
+}
+
+/* Inspects the response to the OPTIONS request cloud sync opens with.
+ *
+ * The URL cloud sync is given is a collection, and Allow describes the
+ * collection itself: PUT is not defined on one (RFC 4918 9.7.1), so a
+ * correct server may well leave it out and its absence says nothing
+ * about the endpoint. What separates a WebDAV server from a plain HTTP
+ * server that answers OPTIONS is the DAV header it announces itself
+ * with (RFC 4918 10.1), and failing that, whether it offers any method
+ * only WebDAV defines. */
+static void webdav_check_options(http_transfer_data_t *data,
+      bool *dav, bool *allow_seen, bool *allow_dav_method)
+{
+   const char *hdr;
+
+   for (hdr = net_http_header_next(data->headers, NULL); hdr;
+         hdr = net_http_header_next(data->headers, hdr))
+   {
+
+      if (string_starts_with_case_insensitive(hdr, "DAV:"))
+         *dav = true;
+      else if (string_starts_with_case_insensitive(hdr, "Allow:"))
+      {
+         const char *allow = hdr + STRLEN_CONST("Allow:");
+
+         *allow_seen = true;
+         if (     webdav_allow_lists_method(allow, "PROPFIND")
+               || webdav_allow_lists_method(allow, "MKCOL")
+               || webdav_allow_lists_method(allow, "PROPPATCH"))
+            *allow_dav_method = true;
+      }
+   }
+}
+
+static void webdav_stat_cb(retro_task_t *task, void *task_data, void *user_data, const char *err)
+{
+   webdav_state_t       *webdav_st    = webdav_state_get_ptr();
+   webdav_cb_state_t    *webdav_cb_st = (webdav_cb_state_t *)user_data;
+   http_transfer_data_t *data         = (http_transfer_data_t*)task_data;
+   bool                  success      = (data && data->status >= 200 && data->status < 300);
+
+   if (!webdav_cb_st)
+      return;
+
+   if (!data)
+      RARCH_WARN("[webdav] Did not get data for stat, is the server down?\n");
+
+   if (webdav_retry_auth(data, &webdav_cb_st->reauthed))
+   {
+      const char *auth_header = webdav_get_auth_header("OPTIONS", webdav_st->url);
+
+      /* With no credentials configured there is nothing new to put in
+       * the retry, so repeating the request would meet the same
+       * challenge for as long as the server keeps issuing it. */
+      if (auth_header)
+      {
+         task_push_webdav_stat(webdav_st->url, true, auth_header, webdav_stat_cb, webdav_cb_st);
+         return;
+      }
+
+      RARCH_ERR("[webdav] %s asks for authentication, but no username or password is configured.\n",
+            webdav_st->url);
+   }
+
+   if (!success && data)
+       webdav_log_http_failure(webdav_st->url, data, err);
+
+   if (success && data)
+   {
+      bool dav              = false;
+      bool allow_seen       = false;
+      bool allow_dav_method = false;
+
+      webdav_check_options(data, &dav, &allow_seen, &allow_dav_method);
+
+      /* A server that answers OPTIONS with neither the DAV header nor
+       * a single WebDAV method in Allow is an ordinary HTTP server,
+       * and it will refuse the first PUT far too late to tell the user
+       * anything useful. Anything that shows either one is taken at
+       * its word; PUT's absence from a collection's Allow means
+       * nothing (RFC 4918 9.7.1) and is not consulted. */
+      webdav_st->dav_verified = dav || allow_dav_method;
+
+      if (webdav_st->dav_verified)
+      {
+         if (!dav)
+            RARCH_WARN("[webdav] %s did not return a DAV header, but offers WebDAV methods. Continuing.\n",
+                  webdav_st->url);
+      }
+      else if (allow_seen)
+      {
+         RARCH_ERR("[webdav] %s answers OPTIONS but offers no WebDAV method, so it is not a WebDAV endpoint. Check the URL: providers commonly serve WebDAV over https only, on a dedicated host.\n",
+               webdav_st->url);
+         success = false;
+      }
+      else
+         RARCH_WARN("[webdav] %s returned neither a DAV header nor an Allow header, so it may not be a WebDAV endpoint. Continuing anyway.\n",
+               webdav_st->url);
+   }
+
+   webdav_cb_st->cb(webdav_cb_st->user_data, NULL, success, NULL);
+   free(webdav_cb_st);
+}
+
+static bool webdav_sync_begin(cloud_sync_complete_handler_t cb, void *user_data)
+{
+   const char *auth_header;
+   size_t _len                  = 0;
+   settings_t        *settings  = config_get_ptr();
+   const char        *url       = settings->arrays.webdav_url;
+   webdav_state_t    *webdav_st = webdav_state_get_ptr();
+
+   if (!url || !*url)
+      return false;
+
+#ifndef HAVE_SSL
+   if (strncmp(url, "https", 5) == 0)
+   {
+      RARCH_ERR("[webdav] This build has no TLS support, so the https URL %s cannot be used.\n", url);
+      return false;
+   }
+#endif
+   /* TODO/FIXME: LOCK? */
+   if (!strstr(url, "://"))
+       _len += strlcpy_lit(webdav_st->url, "http://", (sizeof("http://")-1));
+   strlcpy(webdav_st->url + _len, url, sizeof(webdav_st->url) - _len);
+   fill_pathname_slash(webdav_st->url, sizeof(webdav_st->url));
+
+   /* A new sync knows nothing about the server's collections yet. */
+   if (webdav_st->dirs)
+      string_list_free(webdav_st->dirs);
+   webdav_st->dirs         = NULL;
+   webdav_st->dav_verified = false;
+
+   /* URL/username/password may have changed, redo auth check */
+   webdav_st->basic = true;
+   auth_header      = webdav_get_auth_header(NULL, NULL);
+
+   {
+      webdav_cb_state_t *webdav_cb_st = (webdav_cb_state_t*)calloc(1, sizeof(webdav_cb_state_t));
+
+      if (!webdav_cb_st)
+         return false;
+
+      webdav_cb_st->cb        = cb;
+      webdav_cb_st->user_data = user_data;
+
+      /* An endpoint that wants no credentials still has to be probed.
+       * The OPTIONS response is the only thing that establishes the
+       * server speaks WebDAV, and MKCOL's 405 on a collection that is
+       * already there (RFC 4918 9.3.1) is only forgiven once it has:
+       * skipping the probe leaves every upload into an existing
+       * directory failing on that 405. */
+      if (!auth_header)
+         RARCH_LOG("[webdav] No username or password configured for %s, continuing anonymously.\n",
+               webdav_st->url);
+
+      task_push_webdav_stat(webdav_st->url, true, auth_header, webdav_stat_cb, webdav_cb_st);
+   }
+
+   return true;
+}
+
+static bool webdav_sync_end(cloud_sync_complete_handler_t cb, void *user_data)
+{
+   webdav_state_t *webdav_st = webdav_state_get_ptr();
+
+   /* TODO/FIXME: UNLOCK? */
+
+   if (webdav_st->basic_auth_header)
+      free(webdav_st->basic_auth_header);
+   webdav_st->basic_auth_header = NULL;
+
+   if (webdav_st->dirs)
+      string_list_free(webdav_st->dirs);
+   webdav_st->dirs = NULL;
+
+   webdav_cleanup_digest();
+
+   cb(user_data, NULL, true, NULL);
+   return true;
+}
+
+static void webdav_read_cb(retro_task_t *task, void *task_data, void *user_data, const char *err)
+{
+   webdav_cb_state_t    *webdav_cb_st = (webdav_cb_state_t *)user_data;
+   http_transfer_data_t *data         = (http_transfer_data_t*)task_data;
+   RFILE                *file         = NULL;
+   bool                  found        = (data
+                                      && data->status >= 200
+                                      && data->status < 300);
+   bool                  success      = (found || (data && data->status == 404));
+
+   if (!webdav_cb_st)
+   {
+      RARCH_WARN("[webdav] Missing cb data in read?\n");
+      return;
+   }
+
+   if (!success && data)
+       webdav_log_http_failure(webdav_cb_st->path, data, err);
+
+   if (webdav_retry_auth(data, &webdav_cb_st->reauthed))
+   {
+      char            url_encoded[PATH_MAX_LENGTH];
+      const char     *auth_header;
+
+      if (!webdav_url_for_path(url_encoded, sizeof(url_encoded), webdav_cb_st->path, NULL))
+      {
+         webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, false, NULL);
+         free(webdav_cb_st);
+         return;
+      }
+
+      RARCH_DBG("[webdav] GET %s\n", url_encoded);
+      auth_header = webdav_get_auth_header("GET", url_encoded);
+      task_push_http_download_staged_file(url_encoded,
+            webdav_cb_st->file, true, NULL, auth_header,
+            webdav_read_cb, webdav_cb_st);
+      return;
+   }
+
+   /* A body delimited only by the connection closing may have been
+    * cut off; do not let it replace the local file. */
+   if (found && !net_http_body_is_framed(data->headers))
+   {
+      RARCH_WARN("[webdav] %s: response body has no Content-Length or "
+            "chunked framing; treating as failure.\n", webdav_cb_st->path);
+      filestream_delete(webdav_cb_st->file);
+      found   = false;
+      success = false;
+   }
+
+   /* A found file always comes back as an open RFILE, even an empty
+    * one, and a file that cannot be written locally is a failure.
+    * That leaves success with no file meaning only one thing: the
+    * server does not have it (404). */
+   if (found)
+   {
+      /* The body went to the file as it arrived */
+      if (!(file = filestream_open(webdav_cb_st->file,
+                  RETRO_VFS_FILE_ACCESS_READ,
+                  RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK)))
+      {
+         RARCH_WARN("[webdav] Could not open \"%s\".\n", webdav_cb_st->file);
+         success = false;
+      }
+   }
+
+   webdav_cb_st->cb(webdav_cb_st->user_data,
+         webdav_cb_st->path, success, file);
+   free(webdav_cb_st);
+}
+
+static bool webdav_read(const char *path, const char *file,
+      cloud_sync_complete_handler_t cb, void *user_data)
+{
+   void              *t;
+   const char        *auth_header;
+   char               url_encoded[PATH_MAX_LENGTH];
+   webdav_cb_state_t *webdav_cb_st = (webdav_cb_state_t*)calloc(1, sizeof(webdav_cb_state_t));
+
+   if (!webdav_cb_st || !webdav_url_for_path(url_encoded, sizeof(url_encoded), path, NULL))
+   {
+      free(webdav_cb_st);
+      return false;
+   }
+
+   webdav_cb_st->cb        = cb;
+   webdav_cb_st->user_data = user_data;
+   strlcpy(webdav_cb_st->path, path, sizeof(webdav_cb_st->path));
+   strlcpy(webdav_cb_st->file, file, sizeof(webdav_cb_st->file));
+
+   RARCH_DBG("[webdav] GET %s\n", url_encoded);
+   auth_header = webdav_get_auth_header("GET", url_encoded);
+   /* Downloaded straight to the file, as it arrives */
+   t = task_push_http_download_staged_file(url_encoded,
+         webdav_cb_st->file, true, NULL, auth_header,
+         webdav_read_cb, webdav_cb_st);
+   return (t != NULL);
+}
+
+/* WebDAV paths are case-sensitive, so this cannot use
+ * string_list_find_elem(), which folds case. */
+static bool webdav_dir_is_known(const char *url)
+{
+   webdav_state_t *webdav_st = webdav_state_get_ptr();
+   size_t i;
+
+   if (!webdav_st->dirs)
+      return false;
+
+   for (i = 0; i < webdav_st->dirs->size; i++)
+      if (string_is_equal(webdav_st->dirs->elems[i].data, url))
+         return true;
+
+   return false;
+}
+
+static void webdav_dir_remember(const char *url)
+{
+   union string_list_elem_attr attr;
+   webdav_state_t *webdav_st = webdav_state_get_ptr();
+
+   if (!webdav_st->dirs)
+      if (!(webdav_st->dirs = string_list_new()))
+         return;
+
+   if (webdav_dir_is_known(url))
+      return;
+
+   attr.i = 0;
+   string_list_append(webdav_st->dirs, url, attr);
+}
+
+static void webdav_mkdir_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *err);
+
+/* Each upload walks the same directory prefixes and several uploads run
+ * at once, so ask the server only for the collections this sync has not
+ * created yet.  Task callbacks are retired on the main thread, so the
+ * list needs no lock. */
+static void webdav_mkdir_push(webdav_mkdir_state_t *webdav_mkdir_st)
+{
+   const char *auth_header;
+
+   /* Each collection in the walk is a request of its own. */
+   webdav_mkdir_st->reauthed = false;
+
+   if (webdav_dir_is_known(webdav_mkdir_st->url))
+   {
+      http_transfer_data_t data;
+      memset(&data, 0, sizeof(data));
+      data.status = 200;
+      webdav_mkdir_cb(NULL, &data, webdav_mkdir_st, NULL);
+      return;
+   }
+
+   RARCH_DBG("[webdav] MKCOL %s\n", webdav_mkdir_st->url);
+   auth_header = webdav_get_auth_header("MKCOL", webdav_mkdir_st->url);
+   task_push_webdav_mkdir(webdav_mkdir_st->url, true, auth_header,
+         webdav_mkdir_cb, webdav_mkdir_st);
+}
+
+static void webdav_mkdir_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *err)
+{
+   const char *auth_header;
+   webdav_mkdir_state_t *webdav_mkdir_st = (webdav_mkdir_state_t *)user_data;
+   http_transfer_data_t *data            = (http_transfer_data_t*)task_data;
+   webdav_state_t       *webdav_st       = webdav_state_get_ptr();
+
+   if (!webdav_mkdir_st)
+      return;
+
+   if (webdav_retry_auth(data, &webdav_mkdir_st->reauthed))
+   {
+      RARCH_DBG("[webdav] MKCOL %s\n", webdav_mkdir_st->url);
+      auth_header = webdav_get_auth_header("MKCOL", webdav_mkdir_st->url);
+      task_push_webdav_mkdir(webdav_mkdir_st->url, true, auth_header, webdav_mkdir_cb, webdav_mkdir_st);
+      return;
+   }
+
+   /* HTTP 405 on MKCOL means it's already there (RFC 4918 9.3.1) -- but
+    * only on a server that implements MKCOL at all.  A plain HTTP server
+    * answers 405 because it has never heard of the method, and treating
+    * that as success walks the whole sync through to a pile of failed
+    * PUTs. */
+   if (   !data
+       || data->status < 200
+       || (   data->status >= 400
+           && !(data->status == 405 && webdav_st->dav_verified)))
+   {
+      if (data)
+         webdav_log_http_failure(webdav_mkdir_st->url, data, err);
+      else
+         RARCH_WARN("[webdav] Could not mkdir %s\n", webdav_mkdir_st ? webdav_mkdir_st->url : "<unknown>");
+      webdav_mkdir_st->cb(false, webdav_mkdir_st->cb_st);
+      free(webdav_mkdir_st);
+      return;
+   }
+
+   /* url is truncated to the prefix that just came back, except on the
+    * synthetic call webdav_ensure_dir() starts the walk with, where the
+    * full path is still intact. */
+   if (webdav_mkdir_st->last_slash && !webdav_mkdir_st->last_slash[1])
+      webdav_dir_remember(webdav_mkdir_st->url);
+
+   webdav_mkdir_st->last_slash[1] = webdav_mkdir_st->post_slash;
+   webdav_mkdir_st->last_slash = strchr(webdav_mkdir_st->last_slash + 1, '/');
+   if (webdav_mkdir_st->last_slash)
+   {
+      webdav_mkdir_st->post_slash    = webdav_mkdir_st->last_slash[1];
+      webdav_mkdir_st->last_slash[1] = '\0';
+      webdav_mkdir_push(webdav_mkdir_st);
+   }
+   else
+   {
+      RARCH_DBG("[webdav] MKCOL %s success\n", webdav_mkdir_st->url);
+      webdav_mkdir_st->cb(true, webdav_mkdir_st->cb_st);
+      free(webdav_mkdir_st);
+   }
+}
+
+static void webdav_ensure_dir(const char *dir, webdav_mkdir_cb_t cb,
+      webdav_cb_state_t *webdav_cb_st)
+{
+   size_t                 base_len;
+   http_transfer_data_t   data;
+   webdav_mkdir_state_t *webdav_mkdir_st = (webdav_mkdir_state_t *)malloc(sizeof(webdav_mkdir_state_t));
+
+   if (!webdav_mkdir_st)
+   {
+      cb(false, webdav_cb_st);
+      return;
+   }
+   if (!webdav_url_for_path(webdav_mkdir_st->url,
+            sizeof(webdav_mkdir_st->url), dir, &base_len))
+   {
+      free(webdav_mkdir_st);
+      cb(false, webdav_cb_st);
+      return;
+   }
+   webdav_mkdir_st->last_slash = strchr(webdav_mkdir_st->url + base_len - 1, '/');
+   webdav_mkdir_st->post_slash = webdav_mkdir_st->last_slash[1];
+   webdav_mkdir_st->cb         = cb;
+   webdav_mkdir_st->cb_st      = webdav_cb_st;
+   webdav_mkdir_st->reauthed   = false;
+
+   /* this is a recursive callback, set it up so it looks like it's still proceeding */
+   data.status = 200;
+   webdav_mkdir_cb(NULL, &data, webdav_mkdir_st, NULL);
+}
+
+static void webdav_do_update(bool success, webdav_cb_state_t *webdav_cb_st);
+
+static void webdav_update_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *err)
+{
+   webdav_cb_state_t    *webdav_cb_st = (webdav_cb_state_t *)user_data;
+   http_transfer_data_t *data         = (http_transfer_data_t*)task_data;
+   bool                  success      = (data && data->status >= 200 && data->status < 300);
+
+   if (!webdav_cb_st)
+   {
+      RARCH_WARN("[webdav] Missing cb data in update?\n");
+      return;
+   }
+
+   if (!success && data)
+       webdav_log_http_failure(webdav_cb_st->path, data, err);
+   else if (!data)
+      RARCH_WARN("[webdav] Could not upload %s\n", webdav_cb_st->path);
+
+   if (webdav_retry_auth(data, &webdav_cb_st->reauthed))
+   {
+      webdav_do_update(true, webdav_cb_st);
+      return;
+   }
+
+   webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, success, webdav_cb_st->rfile);
+   free(webdav_cb_st);
+}
+
+/* The upload body, pulled from the open save file by net_http on the
+ * task thread as the socket takes it. */
+static int64_t webdav_upload_source(void *userdata, void *buf, size_t len)
+{
+   return filestream_read((RFILE*)userdata, buf, (int64_t)len);
+}
+
+static bool webdav_upload_rewind(void *userdata)
+{
+   return filestream_seek((RFILE*)userdata, 0, SEEK_SET) == 0;
+}
+
+static void webdav_do_update(bool success, webdav_cb_state_t *webdav_cb_st)
+{
+   char            url_encoded[PATH_MAX_LENGTH];
+   int64_t         len;
+   const char     *auth_header;
+
+   if (!webdav_cb_st)
+      return;
+
+   if (!success)
+   {
+      RARCH_DBG("[webdav] Cannot upload %s\n", webdav_cb_st->path);
+      webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, false, webdav_cb_st->rfile);
+      free(webdav_cb_st);
+      return;
+   }
+
+   if (!webdav_url_for_path(url_encoded, sizeof(url_encoded), webdav_cb_st->path, NULL))
+   {
+      webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, false, webdav_cb_st->rfile);
+      free(webdav_cb_st);
+      return;
+   }
+
+   /* The file is streamed onto the wire from rfile as the socket takes
+    * it, one send buffer at a time, rather than read whole into memory
+    * first. Rewind first: a retry after a Digest challenge comes back
+    * here with the file already read to its end, and without the seek
+    * the upload would carry nothing. A short read fails the upload. */
+   len = filestream_get_size(webdav_cb_st->rfile);
+   if (len < 0 || filestream_seek(webdav_cb_st->rfile, 0, SEEK_SET) < 0)
+   {
+      RARCH_ERR("[webdav] Could not read %s for upload.\n", webdav_cb_st->path);
+      webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, false, webdav_cb_st->rfile);
+      free(webdav_cb_st);
+      return;
+   }
+
+   RARCH_DBG("[webdav] PUT %s\n", url_encoded);
+   auth_header = webdav_get_auth_header("PUT", url_encoded);
+   task_push_webdav_put_stream(url_encoded,
+         webdav_upload_source, webdav_upload_rewind, webdav_cb_st->rfile,
+         (size_t)len, true, auth_header, webdav_update_cb, webdav_cb_st);
+}
+
+/* Where the backup of @path goes: deleted/<path>-<yymmdd-hhmmss>, the
+ * same place a non-destructive delete moves it to.  Keep the trailing
+ * '/': with a bare "deleted" the join falls back to PATH_DEFAULT_SLASH,
+ * which is a backslash on Windows and would then be sent as %5C
+ * instead of a collection separator. */
+static bool webdav_backup_path(char *s, size_t len, const char *path)
+{
+   struct tm tm_;
+   time_t    cur_time = time(NULL);
+   size_t    _len     = fill_pathname_join_special(s, "deleted/", path, len);
+
+   rtime_localtime(&cur_time, &tm_);
+   return _len < len
+       && strftime(s + _len, len - _len, "-%y%m%d-%H%M%S", &tm_) != 0;
+}
+
+/* The upload itself: create the file's collection if needed, then PUT. */
+static void webdav_update_upload(webdav_cb_state_t *webdav_cb_st)
+{
+   char dir[DIR_MAX_LENGTH];
+
+   if (strchr(webdav_cb_st->path, '/'))
+   {
+      fill_pathname_basedir(dir, webdav_cb_st->path, sizeof(dir));
+      webdav_ensure_dir(dir, webdav_do_update, webdav_cb_st);
+   }
+   else
+      webdav_do_update(true, webdav_cb_st);
+}
+
+static void webdav_do_update_backup(bool success, webdav_cb_state_t *webdav_cb_st);
+
+static void webdav_update_backup_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *err)
+{
+   webdav_cb_state_t    *webdav_cb_st = (webdav_cb_state_t *)user_data;
+   http_transfer_data_t *data         = (http_transfer_data_t*)task_data;
+   bool                  copied       = (data && data->status >= 200 && data->status < 300);
+
+   if (!webdav_cb_st)
+   {
+      RARCH_WARN("[webdav] Missing cb data in update backup?\n");
+      return;
+   }
+
+   if (webdav_retry_auth(data, &webdav_cb_st->reauthed))
+   {
+      webdav_do_update_backup(true, webdav_cb_st);
+      return;
+   }
+
+   /* 404: nothing on the server yet, so nothing to keep. */
+   if (copied || (data && data->status == 404))
+   {
+      /* The PUT is a request of its own. */
+      webdav_cb_st->reauthed = false;
+      webdav_update_upload(webdav_cb_st);
+      return;
+   }
+
+   if (data)
+      webdav_log_http_failure(webdav_cb_st->path, data, err);
+   RARCH_ERR("[webdav] Not uploading %s: the copy on the server could not be backed up.\n",
+         webdav_cb_st->path);
+   webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, false, webdav_cb_st->rfile);
+   free(webdav_cb_st);
+}
+
+/* COPY, not MOVE: the server keeps its current copy until the PUT
+ * replaces it, so an upload that fails after the backup leaves the
+ * server as it was rather than without the file. */
+static void webdav_do_update_backup(bool success, webdav_cb_state_t *webdav_cb_st)
+{
+   const char *auth_header;
+   char  dest[PATH_MAX_LENGTH];
+   char  dest_encoded[PATH_MAX_LENGTH];
+   char  url_encoded[PATH_MAX_LENGTH];
+
+   if (!webdav_cb_st)
+      return;
+
+   if (   !success
+       || !webdav_backup_path(dest, sizeof(dest), webdav_cb_st->path)
+       || !webdav_url_for_path(url_encoded, sizeof(url_encoded), webdav_cb_st->path, NULL)
+       || !webdav_url_for_path(dest_encoded, sizeof(dest_encoded), dest, NULL))
+   {
+      RARCH_ERR("[webdav] Not uploading %s: the copy on the server could not be backed up.\n",
+            webdav_cb_st->path);
+      webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, false, webdav_cb_st->rfile);
+      free(webdav_cb_st);
+      return;
+   }
+
+   RARCH_DBG("[webdav] COPY %s -> %s\n", url_encoded, dest_encoded);
+   auth_header = webdav_get_auth_header("COPY", url_encoded);
+   task_push_webdav_copy(url_encoded, dest_encoded, true, auth_header,
+         webdav_update_backup_cb, webdav_cb_st);
+}
+
+static bool webdav_update(const char *path, RFILE *rfile,
+      cloud_sync_complete_handler_t cb, void *user_data)
+{
+   settings_t        *settings     = config_get_ptr();
+   webdav_cb_state_t *webdav_cb_st = (webdav_cb_state_t*)calloc(1, sizeof(webdav_cb_state_t));
+
+   if (!webdav_cb_st)
+      return false;
+
+   webdav_cb_st->cb = cb;
+   webdav_cb_st->user_data = user_data;
+   strlcpy(webdav_cb_st->path, path, sizeof(webdav_cb_st->path));
+   webdav_cb_st->rfile = rfile;
+
+   /* With destructive sync off, a delete keeps the server's copy in
+    * deleted/, and so does an upload that replaces it: otherwise the
+    * setting protected against the server's copy being removed but not
+    * against it being overwritten.  The local side does the same with
+    * cloud_backups/ before a fetch replaces a local file.  The server
+    * manifest is rewritten every sync and is not backed up. */
+   if (   !settings->bools.cloud_sync_destructive
+       && !string_is_equal(path, CLOUD_SYNC_SERVER_MANIFEST))
+   {
+      char   dir[DIR_MAX_LENGTH];
+      size_t _len = strlcpy_lit(dir, "deleted/", sizeof(dir));
+      fill_pathname_basedir(dir + _len, path, sizeof(dir) - _len);
+      webdav_ensure_dir(dir, webdav_do_update_backup, webdav_cb_st);
+   }
+   else
+      webdav_update_upload(webdav_cb_st);
+
+   return true;
+}
+
+static void webdav_delete_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *err)
+{
+   webdav_cb_state_t    *webdav_cb_st = (webdav_cb_state_t *)user_data;
+   http_transfer_data_t *data         = (http_transfer_data_t*)task_data;
+   bool                  success      = (data != NULL && data->status >= 200 && data->status < 300);
+
+   if (!webdav_cb_st)
+   {
+      RARCH_WARN("[webdav] Missing cb data in delete?\n");
+      return;
+   }
+
+   if (!success && data)
+      webdav_log_http_failure(webdav_cb_st->path, data, err);
+   else if (!data)
+      RARCH_WARN("[webdav] Could not delete %s\n", webdav_cb_st->path);
+
+   if (webdav_retry_auth(data, &webdav_cb_st->reauthed))
+   {
+      char            url_encoded[PATH_MAX_LENGTH];
+      const char     *auth_header;
+
+      if (!webdav_url_for_path(url_encoded, sizeof(url_encoded), webdav_cb_st->path, NULL))
+      {
+         webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, false, NULL);
+         free(webdav_cb_st);
+         return;
+      }
+
+      RARCH_DBG("[webdav] DELETE %s\n", url_encoded);
+      auth_header = webdav_get_auth_header("DELETE", url_encoded);
+      task_push_webdav_delete(url_encoded, true, auth_header, webdav_delete_cb, webdav_cb_st);
+      return;
+   }
+
+   webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, success, NULL);
+   free(webdav_cb_st);
+}
+
+static void webdav_do_backup(bool success, webdav_cb_state_t *webdav_cb_st);
+
+static void webdav_backup_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *err)
+{
+   webdav_cb_state_t    *webdav_cb_st = (webdav_cb_state_t *)user_data;
+   http_transfer_data_t *data         = (http_transfer_data_t*)task_data;
+   bool                  success      = (data != NULL && data->status >= 200 && data->status < 300);
+
+   if (!webdav_cb_st)
+   {
+      RARCH_WARN("[webdav] Missing cb data in backup?\n");
+      return;
+   }
+
+   if (!success && data)
+       webdav_log_http_failure(webdav_cb_st->path, data, err);
+   else if (!data)
+      RARCH_WARN("[webdav] Could not backup %s\n", webdav_cb_st->path);
+
+   if (webdav_retry_auth(data, &webdav_cb_st->reauthed))
+   {
+      webdav_do_backup(true, webdav_cb_st);
+      return;
+   }
+
+   webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, success, NULL);
+   free(webdav_cb_st);
+}
+
+static void webdav_do_backup(bool success, webdav_cb_state_t *webdav_cb_st)
+{
+   const char *auth_header;
+   char            dest_encoded[PATH_MAX_LENGTH];
+   char            dest[PATH_MAX_LENGTH];
+   char            url_encoded[PATH_MAX_LENGTH];
+
+   if (!webdav_cb_st)
+      return;
+
+   if (!success)
+   {
+      RARCH_DBG("[webdav] Cannot backup/delete %s\n", webdav_cb_st->path);
+      webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, false, NULL);
+      free(webdav_cb_st);
+      return;
+   }
+
+   if (   !webdav_backup_path(dest, sizeof(dest), webdav_cb_st->path)
+       || !webdav_url_for_path(url_encoded, sizeof(url_encoded), webdav_cb_st->path, NULL)
+       || !webdav_url_for_path(dest_encoded, sizeof(dest_encoded), dest, NULL))
+   {
+      webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, false, NULL);
+      free(webdav_cb_st);
+      return;
+   }
+
+   RARCH_DBG("[webdav] MOVE %s -> %s\n", url_encoded, dest_encoded);
+   auth_header = webdav_get_auth_header("MOVE", url_encoded);
+   task_push_webdav_move(url_encoded, dest_encoded, true, auth_header, webdav_backup_cb, webdav_cb_st);
+}
+
+static bool webdav_delete(const char *path, cloud_sync_complete_handler_t cb, void *user_data)
+{
+   webdav_cb_state_t *webdav_cb_st = (webdav_cb_state_t*)calloc(1, sizeof(webdav_cb_state_t));
+   settings_t        *settings     = config_get_ptr();
+
+   if (!webdav_cb_st)
+      return false;
+
+   webdav_cb_st->cb        = cb;
+   webdav_cb_st->user_data = user_data;
+   strlcpy(webdav_cb_st->path, path, sizeof(webdav_cb_st->path));
+
+   /*
+    * Should all cloud_sync_destructive handling be done in task_cloudsync? I
+    * think not because it gives each driver a chance to do a move rather than a
+    * delete/update. Or we could add a cloud_sync_move() API to the driver.
+    */
+   if (settings->bools.cloud_sync_destructive)
+   {
+      const char *auth_header;
+      char url_encoded[PATH_MAX_LENGTH];
+
+      if (!webdav_url_for_path(url_encoded, sizeof(url_encoded), path, NULL))
+      {
+         free(webdav_cb_st);
+         return false;
+      }
+
+      RARCH_DBG("[webdav] DELETE %s\n", url_encoded);
+      auth_header = webdav_get_auth_header("DELETE", url_encoded);
+      task_push_webdav_delete(url_encoded, true, auth_header, webdav_delete_cb, webdav_cb_st);
+   }
+   else
+   {
+      char dir[DIR_MAX_LENGTH];
+      size_t _len = strlcpy_lit(dir, "deleted/", sizeof(dir));
+      fill_pathname_basedir(dir + _len, path, sizeof(dir) - _len);
+      webdav_ensure_dir(dir, webdav_do_backup, webdav_cb_st);
+   }
+
+   return true;
+}
+
+cloud_sync_driver_t cloud_sync_webdav = {
+   webdav_sync_begin,
+   webdav_sync_end,
+   webdav_read,
+   webdav_update,
+   webdav_delete,
+   "webdav", /* ident */
+   0 /* flags */
+};

@@ -1,0 +1,1079 @@
+/*  RetroArch - A frontend for libretro.
+ *  Copyright (C) 2010-2014 - Hans-Kristian Arntzen
+ *  Copyright (C) 2011-2017 - Daniel De Matteis
+ *  Copyright (C) 2016-2019 - Brad Parker
+ *
+ *  RetroArch is free software: you can redistribute it and/or modify it under the terms
+ *  of the GNU General Public License as published by the Free Software Found-
+ *  ation, either version 3 of the License, or (at your option) any later version.
+ *
+ *  RetroArch is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+ *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ *  PURPOSE.  See the GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License along with RetroArch.
+ *  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#ifndef __MENU_DRIVER_H__
+#define __MENU_DRIVER_H__
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include <boolean.h>
+#include <retro_common_api.h>
+#include <formats/image.h>
+#include <queues/task_queue.h>
+#include <retro_miscellaneous.h>
+
+#ifdef HAVE_CONFIG_H
+#include "../config.h"
+#endif
+
+#include "menu_defines.h"
+#include "menu_input.h"
+#include "../input/input_osk.h"
+#include "menu_entries.h"
+#include "menu_shader.h"
+#include "../gfx/gfx_animation.h"
+#include "../gfx/gfx_display.h"
+#include "../gfx/gfx_thumbnail.h"
+#include "../camera/camera_driver.h"
+#include "../gfx/font_driver.h"
+#include "../performance_counters.h"
+
+
+RETRO_BEGIN_DECLS
+
+#ifndef MAX_COUNTERS
+#define MAX_COUNTERS 64
+#endif
+
+#ifndef MAX_CHEAT_COUNTERS
+#define MAX_CHEAT_COUNTERS 6000
+#endif
+
+#define SCROLL_INDEX_SIZE          (2 * (26 + 2) + 1)
+
+#ifdef __EMSCRIPTEN__
+/* This task reads a variable that is set asynchronously, so the first check might fail.
+ * Check more often because it is cheap and to avoid a long period of missing power info. */
+#define POWERSTATE_CHECK_INTERVAL  1000000
+#else
+#define POWERSTATE_CHECK_INTERVAL  (30 * 1000000)
+#endif
+
+#define DATETIME_CHECK_INTERVAL    1000000
+/* Single-click playlist button hold: entry drawing stays
+ * suppressed for this long (us) after the click */
+#define MENU_DRAW_ENTRY_DELAY      500000
+
+#define MENU_LIST_GET(list, idx) ((list) ? ((list)->menu_stack[(idx)]) : NULL)
+
+#define MENU_LIST_GET_SELECTION(list, idx) ((list) ? ((list)->selection_buf[(idx)]) : NULL)
+
+#define MENU_LIST_GET_STACK_SIZE(list, idx) ((list)->menu_stack[(idx)]->size)
+
+#define MENU_ENTRIES_GET_SELECTION_BUF_PTR_INTERNAL(menu_st, idx) ((menu_st->entries.list) ? MENU_LIST_GET_SELECTION(menu_st->entries.list, (unsigned)idx) : NULL)
+#define MENU_ENTRIES_NEEDS_REFRESH(menu_st) (!((menu_st->flags & MENU_ST_FLAG_ENTRIES_NONBLOCKING_REFRESH) || !(menu_st->flags & MENU_ST_FLAG_ENTRIES_NEED_REFRESH)))
+
+/* How long a press marks a controller's rows */
+#define MENU_PAD_PRESSED_HOLD_US 1000000
+
+/* Whether a press on the controller in @slot marks its rows now */
+/* menu_state.frame_work: what a frame has to do beyond drawing */
+enum menu_frame_work
+{
+   /* a deferred playlist read (playlist_init_cached_deferred()) */
+   MENU_FRAME_WORK_PLAYLIST = (1 << 0),
+   /* presses to look for: two connected controllers show one name,
+    * or did at the last frame */
+   MENU_FRAME_WORK_PAD_FIND = (1 << 1),
+   MENU_FRAME_WORK_PYROWAVE = (1 << 2)
+};
+
+#define MENU_PAD_MARKED(menu_st, slot) ((slot) < MAX_INPUT_DEVICES \
+      && (((menu_st)->pads_marked >> (slot)) & 1))
+
+#define MENU_SETTINGS_CORE_INFO_NONE             0xffff
+#define MENU_SETTINGS_CORE_OPTION_NONE           0xffff
+#define MENU_SETTINGS_CHEEVOS_NONE               0xffff
+#define MENU_SETTINGS_CORE_OPTION_START          0x10000
+#define MENU_SETTINGS_CHEEVOS_START              0x40000
+#define MENU_SETTINGS_NETPLAY_ROOMS_START        0x80000
+
+/* "Normalize" non-alphabetical entries so they
+ * are lumped together for purposes of jumping. */
+#define ELEM_GET_FIRST_CHAR(ret) ((ret < 'a') ? ('a' - 1) : (ret > 'z') ? ('z' + 1) : ret)
+
+enum menu_settings_type
+{
+   MENU_SETTINGS_NONE       = FILE_TYPE_LAST + 1,
+   MENU_SETTINGS,
+   MENU_SETTINGS_TAB,
+   MENU_HISTORY_TAB,
+   MENU_FAVORITES_TAB,
+   MENU_MUSIC_TAB,
+   MENU_VIDEO_TAB,
+   MENU_IMAGES_TAB,
+   MENU_NETPLAY_TAB,
+   MENU_EXPLORE_TAB,
+   MENU_CONTENTLESS_CORES_TAB,
+   MENU_ADD_TAB,
+   MENU_PLAYLISTS_TAB,
+   MENU_SETTING_DROPDOWN_ITEM,
+   MENU_SETTING_DROPDOWN_ITEM_RESOLUTION,
+   MENU_SETTING_DROPDOWN_ITEM_CRT_SUPER_RESOLUTION,
+   MENU_SETTING_DROPDOWN_ITEM_HEADSET_REFRESH_RATE,
+   MENU_SETTING_DROPDOWN_ITEM_VIDEO_SHADER_PARAM,
+   MENU_SETTING_DROPDOWN_ITEM_VIDEO_SHADER_PRESET_PARAM,
+   MENU_SETTING_DROPDOWN_ITEM_VIDEO_SHADER_NUM_PASS,
+   MENU_SETTING_DROPDOWN_ITEM_PLAYLIST_DEFAULT_CORE,
+   MENU_SETTING_DROPDOWN_ITEM_PLAYLIST_LABEL_DISPLAY_MODE,
+   MENU_SETTING_DROPDOWN_ITEM_PLAYLIST_RIGHT_THUMBNAIL_MODE,
+   MENU_SETTING_DROPDOWN_ITEM_PLAYLIST_LEFT_THUMBNAIL_MODE,
+   MENU_SETTING_DROPDOWN_ITEM_PLAYLIST_SORT_MODE,
+   MENU_SETTING_DROPDOWN_ITEM_SCAN_METHOD,
+   MENU_SETTING_DROPDOWN_ITEM_SCAN_USE_DB,
+   MENU_SETTING_DROPDOWN_ITEM_SCAN_DB_SELECT,
+   MENU_SETTING_DROPDOWN_ITEM_MANUAL_CONTENT_SCAN_SYSTEM_NAME,
+   MENU_SETTING_DROPDOWN_ITEM_MANUAL_CONTENT_SCAN_CORE_NAME,
+   MENU_SETTING_DROPDOWN_ITEM_DISK_INDEX,
+   MENU_SETTING_DROPDOWN_ITEM_INPUT_RETROPAD_BIND,
+   MENU_SETTING_DROPDOWN_ITEM_INPUT_DEVICE_TYPE,
+   MENU_SETTING_DROPDOWN_ITEM_INPUT_DEVICE_INDEX,
+   MENU_SETTING_DROPDOWN_ITEM_INPUT_SELECT_RESERVED_DEVICE,
+   MENU_SETTING_DROPDOWN_ITEM_INPUT_PLAYS_AS,
+   MENU_SETTING_DROPDOWN_ITEM_INPUT_PLAYS_AS_ADD,
+#ifdef ANDROID
+    MENU_SETTING_DROPDOWN_ITEM_INPUT_SELECT_PHYSICAL_KEYBOARD,
+#endif
+   MENU_SETTING_DROPDOWN_ITEM_INPUT_DESCRIPTION,
+   MENU_SETTING_DROPDOWN_ITEM_INPUT_DESCRIPTION_KBD,
+   MENU_SETTING_DROPDOWN_ITEM_AUDIO_DEVICE,
+#ifdef HAVE_MICROPHONE
+   MENU_SETTING_DROPDOWN_ITEM_MICROPHONE_DEVICE,
+#endif
+#ifdef HAVE_NETWORKING
+   MENU_SETTING_DROPDOWN_ITEM_NETPLAY_MITM_SERVER,
+#endif
+   MENU_SETTING_DROPDOWN_SETTING_CORE_OPTIONS_ITEM,
+   MENU_SETTING_DROPDOWN_SETTING_STRING_OPTIONS_ITEM,
+   MENU_SETTING_DROPDOWN_SETTING_FLOAT_ITEM,
+   MENU_SETTING_DROPDOWN_SETTING_INT_ITEM,
+   MENU_SETTING_DROPDOWN_SETTING_UINT_ITEM,
+   MENU_SETTING_DROPDOWN_SETTING_CORE_OPTIONS_ITEM_SPECIAL,
+   MENU_SETTING_DROPDOWN_SETTING_STRING_OPTIONS_ITEM_SPECIAL,
+   MENU_SETTING_DROPDOWN_SETTING_FLOAT_ITEM_SPECIAL,
+   MENU_SETTING_DROPDOWN_SETTING_INT_ITEM_SPECIAL,
+   MENU_SETTING_DROPDOWN_SETTING_UINT_ITEM_SPECIAL,
+   MENU_SETTING_NO_ITEM,
+   MENU_SETTING_DRIVER,
+   MENU_SETTING_ACTION,
+   MENU_SETTING_ACTION_RUN,
+   MENU_SETTING_ACTION_CLOSE,
+   MENU_SETTING_ACTION_CLOSE_HORIZONTAL,
+   MENU_SETTING_ACTION_CORE_OPTIONS,
+   MENU_SETTING_ACTION_CORE_OPTION_OVERRIDE_LIST,
+   MENU_SETTING_ACTION_CORE_INPUT_REMAPPING_OPTIONS,
+   MENU_SETTING_ACTION_REMAP_FILE_MANAGER_LIST,
+   MENU_SETTING_ACTION_CORE_CHEAT_OPTIONS,
+   MENU_SETTING_ACTION_CORE_MANAGER_OPTIONS,
+#ifdef HAVE_MIST
+   MENU_SETTING_ACTION_CORE_MANAGER_STEAM_OPTIONS,
+   MENU_SETTING_ACTION_CORE_STEAM_INSTALL,
+   MENU_SETTING_ACTION_CORE_STEAM_UNINSTALL,
+#endif
+   MENU_SETTING_ACTION_CORE_DISK_OPTIONS,
+   MENU_SETTING_ACTION_CORE_SHADER_OPTIONS,
+   MENU_SETTING_ACTION_SAVESTATE,
+   MENU_SETTING_ACTION_LOADSTATE,
+   MENU_SETTING_ACTION_PLAYREPLAY,
+   MENU_SETTING_ACTION_RECORDREPLAY,
+   MENU_SETTING_ACTION_HALTREPLAY,
+   MENU_SETTING_ACTION_SCREENSHOT,
+   MENU_SETTING_ACTION_DELETE_ENTRY,
+   MENU_SETTING_ACTION_RESET,
+   MENU_SETTING_ACTION_CORE_LOCK,
+   MENU_SETTING_ACTION_CORE_SET_STANDALONE_EXEMPT,
+   MENU_SETTING_ACTION_CORE_SIGNATURE_CHECK,
+   MENU_SETTING_ACTION_CORE_TRUST,
+   MENU_SETTING_ACTION_CORE_DELETE,
+   MENU_SETTING_ACTION_FAVORITES_DIR, /* "Start Directory" */
+   MENU_SETTING_STRING_OPTIONS,
+   MENU_SETTING_GROUP,
+   MENU_SETTING_SUBGROUP,
+   MENU_SETTING_HORIZONTAL_MENU,
+   MENU_SETTING_ACTION_PAUSE_ACHIEVEMENTS,
+   MENU_SETTING_ACTION_RESUME_ACHIEVEMENTS,
+   MENU_INFO_ACHIEVEMENTS_SERVER_UNREACHABLE,
+   MENU_SETTING_PLAYLIST_MANAGER_DEFAULT_CORE,
+   MENU_SETTING_PLAYLIST_MANAGER_LABEL_DISPLAY_MODE,
+   MENU_SETTING_PLAYLIST_MANAGER_RIGHT_THUMBNAIL_MODE,
+   MENU_SETTING_PLAYLIST_MANAGER_LEFT_THUMBNAIL_MODE,
+   MENU_SETTING_PLAYLIST_MANAGER_SORT_MODE,
+   MENU_BLUETOOTH,
+   MENU_WIFI,
+   MENU_WIFI_DISCONNECT,
+   MENU_ROOM,
+   MENU_ROOM_LAN,
+   MENU_ROOM_RELAY,
+   MENU_NETPLAY_LAN_SCAN,
+   MENU_NETPLAY_KICK,
+   MENU_NETPLAY_BAN,
+   MENU_INFO_MESSAGE,
+   MENU_SETTINGS_SHADER_PARAMETER_0,
+   MENU_SETTINGS_SHADER_PARAMETER_LAST = MENU_SETTINGS_SHADER_PARAMETER_0 + (GFX_MAX_PARAMETERS - 1),
+   MENU_SETTINGS_SHADER_PRESET_PARAMETER_0,
+   MENU_SETTINGS_SHADER_PRESET_PARAMETER_LAST = MENU_SETTINGS_SHADER_PRESET_PARAMETER_0 + (GFX_MAX_PARAMETERS - 1),
+   MENU_SETTINGS_SHADER_PASS_0,
+   MENU_SETTINGS_SHADER_PASS_LAST = MENU_SETTINGS_SHADER_PASS_0 + (GFX_MAX_SHADERS - 1),
+   MENU_SETTINGS_SHADER_PASS_FILTER_0,
+   MENU_SETTINGS_SHADER_PASS_FILTER_LAST = MENU_SETTINGS_SHADER_PASS_FILTER_0  + (GFX_MAX_SHADERS - 1),
+   MENU_SETTINGS_SHADER_PASS_SCALE_0,
+   MENU_SETTINGS_SHADER_PASS_SCALE_LAST = MENU_SETTINGS_SHADER_PASS_SCALE_0  + (GFX_MAX_SHADERS - 1),
+   MENU_SETTINGS_SHADER_PASS_SIMULATED_RES_0,
+   MENU_SETTINGS_SHADER_PASS_SIMULATED_RES_LAST = MENU_SETTINGS_SHADER_PASS_SIMULATED_RES_0 + (GFX_MAX_SHADERS - 1),
+
+   MENU_SETTINGS_CORE_DISK_OPTIONS_DISK_INDEX,
+   MENU_SETTINGS_CORE_DISK_OPTIONS_DISK_IMAGE_APPEND,
+   MENU_SETTINGS_CORE_DISK_OPTIONS_DISK_CYCLE_TRAY_STATUS,
+
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_BEGIN,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_END = MENU_SETTINGS_AUDIO_MIXER_STREAM_BEGIN + MENU_SETTINGS_AUDIO_MIXER_MAX_STREAMS,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_BEGIN,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_END = MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_BEGIN + MENU_SETTINGS_AUDIO_MIXER_MAX_STREAMS,
+
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_STOP_BEGIN,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_STOP_END = MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_STOP_BEGIN + MENU_SETTINGS_AUDIO_MIXER_MAX_STREAMS,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_REMOVE_BEGIN,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_REMOVE_END = MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_REMOVE_BEGIN + MENU_SETTINGS_AUDIO_MIXER_MAX_STREAMS,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_PLAY_BEGIN,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_PLAY_END = MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_PLAY_BEGIN + MENU_SETTINGS_AUDIO_MIXER_MAX_STREAMS,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_PLAY_LOOPED_BEGIN,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_PLAY_LOOPED_END = MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_PLAY_LOOPED_BEGIN + MENU_SETTINGS_AUDIO_MIXER_MAX_STREAMS,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_PLAY_SEQUENTIAL_BEGIN,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_PLAY_SEQUENTIAL_END = MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_PLAY_SEQUENTIAL_BEGIN + MENU_SETTINGS_AUDIO_MIXER_MAX_STREAMS,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_VOLUME_BEGIN,
+   MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_VOLUME_END = MENU_SETTINGS_AUDIO_MIXER_STREAM_ACTIONS_VOLUME_BEGIN + MENU_SETTINGS_AUDIO_MIXER_MAX_STREAMS,
+   MENU_SETTINGS_BIND_BEGIN,
+   MENU_SETTINGS_BIND_LAST = MENU_SETTINGS_BIND_BEGIN + RARCH_ANALOG_RIGHT_Y_MINUS,
+   MENU_SETTINGS_BIND_ALL_LAST = MENU_SETTINGS_BIND_BEGIN + RARCH_MENU_TOGGLE,
+
+   MENU_SETTINGS_CUSTOM_BIND,
+   MENU_SETTINGS_CUSTOM_BIND_KEYBOARD,
+   MENU_SETTINGS_CUSTOM_BIND_ALL,
+   MENU_SETTINGS_CUSTOM_BIND_DEFAULT_ALL,
+   MENU_SETTINGS_LIBRETRO_PERF_COUNTERS_BEGIN,
+   MENU_SETTINGS_LIBRETRO_PERF_COUNTERS_END = MENU_SETTINGS_LIBRETRO_PERF_COUNTERS_BEGIN + (MAX_COUNTERS - 1),
+   MENU_SETTINGS_PERF_COUNTERS_BEGIN,
+   MENU_SETTINGS_PERF_COUNTERS_END = MENU_SETTINGS_PERF_COUNTERS_BEGIN + (MAX_COUNTERS - 1),
+   MENU_SETTINGS_CHEAT_BEGIN,
+   MENU_SETTINGS_CHEAT_END = MENU_SETTINGS_CHEAT_BEGIN + (MAX_CHEAT_COUNTERS - 1),
+
+   MENU_SETTINGS_INPUT_LIBRETRO_DEVICE,
+   MENU_SETTINGS_INPUT_ANALOG_DPAD_MODE,
+   MENU_SETTINGS_INPUT_INPUT_REMAP_PORT,
+   MENU_SETTINGS_INPUT_BEGIN,
+   /* Begin+ count needs to synced with setting_append_list_input_player_options() header items */
+   MENU_SETTINGS_INPUT_BINDS_BEGIN = MENU_SETTINGS_INPUT_BEGIN + 13,
+   MENU_SETTINGS_INPUT_END = MENU_SETTINGS_INPUT_BINDS_BEGIN + RARCH_CUSTOM_BIND_LIST_END,
+   MENU_SETTINGS_INPUT_DESC_BEGIN,
+   MENU_SETTINGS_INPUT_DESC_END = MENU_SETTINGS_INPUT_DESC_BEGIN + (RARCH_ANALOG_BIND_LIST_END * MAX_USERS),
+   MENU_SETTINGS_INPUT_DESC_KBD_BEGIN,
+   MENU_SETTINGS_INPUT_DESC_KBD_END = MENU_SETTINGS_INPUT_DESC_KBD_BEGIN + (RARCH_MAX_KEYS * MAX_USERS),
+   MENU_SETTINGS_REMAPPING_PORT_BEGIN,
+   MENU_SETTINGS_REMAPPING_PORT_END = MENU_SETTINGS_REMAPPING_PORT_BEGIN + (MAX_USERS),
+   /* Settings > Input > Controllers: a connected controller by its
+    * slot, then from MAX_INPUT_DEVICES the Plays As entry of one that
+    * is gone */
+   MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN,
+   MENU_SETTINGS_INPUT_PLAYS_AS_END = MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN + (MAX_INPUT_DEVICES + MAX_USERS),
+
+   MENU_SETTINGS_SUBSYSTEM_LOAD,
+   MENU_SETTINGS_SUBSYSTEM_ADD,
+   MENU_SETTINGS_SUBSYSTEM_LAST = MENU_SETTINGS_SUBSYSTEM_ADD + RARCH_MAX_SUBSYSTEMS,
+   MENU_SETTINGS_CHEAT_MATCH,
+
+   MENU_SET_SCREEN_BRIGHTNESS,
+
+#if defined(HAVE_LIBNX)
+   MENU_SET_SWITCH_CPU_PROFILE,
+#endif
+
+   MENU_SETTINGS_CPU_POLICY_SET_MINFREQ,
+   MENU_SETTINGS_CPU_POLICY_SET_MAXFREQ,
+   MENU_SETTINGS_CPU_POLICY_SET_GOVERNOR,
+   MENU_SETTINGS_CPU_MANAGED_SET_MINFREQ,
+   MENU_SETTINGS_CPU_MANAGED_SET_MAXFREQ,
+
+   MENU_SET_CDROM_LIST,
+   MENU_SET_LOAD_CDROM_LIST,
+   MENU_SET_EJECT_DISC,
+   MENU_SET_CDROM_INFO,
+   MENU_SETTING_ACTION_DELETE_PLAYLIST,
+   MENU_SETTING_ACTION_PLAYLIST_MANAGER_RESET_CORES,
+   MENU_SETTING_ACTION_PLAYLIST_MANAGER_CLEAN_PLAYLIST,
+   MENU_SETTING_ACTION_PLAYLIST_MANAGER_REFRESH_PLAYLIST,
+
+   MENU_SETTING_SCAN_METHOD,
+   MENU_SETTING_SCAN_USE_DB,
+   MENU_SETTING_SCAN_DB_SELECT,
+   MENU_SETTING_MANUAL_CONTENT_SCAN_DIR,
+   MENU_SETTING_MANUAL_CONTENT_SCAN_SYSTEM_NAME,
+   MENU_SETTING_MANUAL_CONTENT_SCAN_CORE_NAME,
+   MENU_SETTING_ACTION_MANUAL_CONTENT_SCAN_START,
+
+   MENU_SETTING_ACTION_CORE_CREATE_BACKUP,
+   MENU_SETTING_ACTION_CORE_RESTORE_BACKUP,
+   MENU_SETTING_ITEM_CORE_RESTORE_BACKUP,
+   MENU_SETTING_ACTION_CORE_DELETE_BACKUP,
+   MENU_SETTING_ITEM_CORE_DELETE_BACKUP,
+
+   MENU_SETTING_ACTION_VIDEO_FILTER_REMOVE,
+   MENU_SETTING_ACTION_AUDIO_DSP_PLUGIN_REMOVE,
+
+   MENU_SETTING_ACTION_GAME_SPECIFIC_CORE_OPTIONS_CREATE,
+   MENU_SETTING_ACTION_GAME_SPECIFIC_CORE_OPTIONS_REMOVE,
+   MENU_SETTING_ACTION_FOLDER_SPECIFIC_CORE_OPTIONS_CREATE,
+   MENU_SETTING_ACTION_FOLDER_SPECIFIC_CORE_OPTIONS_REMOVE,
+   MENU_SETTING_ACTION_CORE_OPTIONS_RESET,
+   MENU_SETTING_ACTION_CORE_OPTIONS_FLUSH,
+
+   MENU_SETTING_ACTION_REMAP_FILE_LOAD,
+   MENU_SETTING_ACTION_REMAP_FILE_SAVE_AS,
+   MENU_SETTING_ACTION_REMAP_FILE_SAVE_CORE,
+   MENU_SETTING_ACTION_REMAP_FILE_SAVE_CONTENT_DIR,
+   MENU_SETTING_ACTION_REMAP_FILE_SAVE_GAME,
+   MENU_SETTING_ACTION_REMAP_FILE_REMOVE_CORE,
+   MENU_SETTING_ACTION_REMAP_FILE_REMOVE_CONTENT_DIR,
+   MENU_SETTING_ACTION_REMAP_FILE_REMOVE_GAME,
+   MENU_SETTING_ACTION_REMAP_FILE_RESET,
+   MENU_SETTING_ACTION_REMAP_FILE_FLUSH,
+
+   MENU_SETTING_ACTION_CONTENTLESS_CORE_RUN,
+   MENU_SETTING_ACTION_STATE_SLOT_RUN,
+
+   MENU_SETTINGS_LAST
+};
+
+struct menu_list
+{
+   file_list_t **menu_stack;
+   size_t menu_stack_size;
+   file_list_t **selection_buf;
+   size_t selection_buf_size;
+};
+
+typedef struct menu_list menu_list_t;
+
+typedef struct menu_ctx_load_image
+{
+   void *data;
+   enum menu_image_type type;
+} menu_ctx_load_image_t;
+
+typedef struct menu_ctx_driver
+{
+   /* Set a framebuffer texture. This is used for instance by RGUI. */
+   void  (*set_texture)(void *data);
+   /* Render a messagebox to the screen. */
+   void  (*render_messagebox)(void *data, const char *msg);
+   void  (*render)(void *data, unsigned dims, bool is_idle);
+   void  (*frame)(void *data, video_frame_info_t *video_info);
+   /* Initializes the menu driver. (setup) */
+   void* (*init)(void**, bool);
+   /* Frees the menu driver. (teardown) */
+   void  (*free)(void*);
+   /* This will be invoked when we are running a hardware context
+    * and we have just flushed the state. For instance - we have
+    * just toggled fullscreen, the GL driver did a teardown/setup -
+    * we now need to rebuild all of our textures and state for the
+    * menu driver. */
+   void  (*context_reset)(void *data, bool video_is_threaded);
+   /* This will be invoked when we are running a hardware context
+    * and the context in question wants to tear itself down. All
+    * textures and related state on the menu driver will also
+    * be freed up then. */
+   void  (*context_destroy)(void *data);
+   void  (*populate_entries)(void *data,
+         const char *path, const char *label,
+         unsigned k);
+   void  (*toggle)(void *userdata, bool);
+   /* This will clear the navigation position. */
+   void  (*navigation_clear)(void *, bool);
+   /* This will decrement the navigation position by one. */
+   void  (*navigation_decrement)(void *data);
+   /* This will increment the navigation position by one. */
+   void  (*navigation_increment)(void *data);
+   void  (*navigation_set)(void *data, bool);
+   void  (*navigation_set_last)(void *data);
+   /* This will descend the navigation position by one alphabet letter. */
+   void  (*navigation_descend_alphabet)(void *, size_t *);
+   /* This will ascend the navigation position by one alphabet letter. */
+   void  (*navigation_ascend_alphabet)(void *, size_t *);
+   /* Initializes a new menu list. */
+   bool  (*lists_init)(void*);
+   void  (*list_insert)(void *userdata,
+         file_list_t *list, const char *, const char *, const char *, size_t,
+         unsigned);
+   int   (*list_prepend)(void *userdata,
+         file_list_t *list, const char *, const char *, size_t);
+   void  (*list_free)(file_list_t *list, size_t, size_t);
+   void  (*list_clear)(file_list_t *list);
+   void  (*list_cache)(void *data, enum menu_list_type, unsigned);
+   int   (*list_push)(void *data, void *userdata, menu_displaylist_info_t*, unsigned);
+   size_t(*list_get_selection)(void *data);
+   size_t(*list_get_size)(void *data, enum menu_list_type type);
+   void *(*list_get_entry)(void *data, enum menu_list_type type, unsigned i);
+   void  (*list_set_selection)(void *data, file_list_t *list);
+   int   (*bind_init)(menu_file_list_cbs_t *cbs,
+         const char *path, const char *label, unsigned type, size_t idx);
+   /* Load an image for use by the menu driver */
+   bool  (*load_image)(void *userdata, void *data, enum menu_image_type type);
+   const char *ident;
+   int (*environ_cb)(enum menu_environ_cb type, void *data, void *userdata);
+   void (*update_thumbnail_path)(void *data, unsigned i, char pos);
+   void (*update_thumbnail_image)(void *data);
+   void (*refresh_thumbnail_image)(void *data, size_t i);
+   void (*set_thumbnail_content)(void *data, const char *s);
+   int  (*osk_ptr_at_pos)(void *data, int x, int y, unsigned dims);
+   bool (*osk_pointer_over_textbox)(void *data, int x, int y, unsigned dims);
+   void (*update_savestate_thumbnail_path)(void *data, unsigned i);
+   void (*update_savestate_thumbnail_image)(void *data);
+   int (*pointer_down)(void *data, unsigned x, unsigned y, unsigned ptr,
+         menu_file_list_cbs_t *cbs,
+         menu_entry_t *entry, unsigned action);
+   int (*pointer_up)(void *data, unsigned x, unsigned y, unsigned ptr,
+         enum menu_input_pointer_gesture gesture,
+         menu_file_list_cbs_t *cbs,
+         menu_entry_t *entry, unsigned action);
+   /* This will be invoked whenever a menu entry action
+    * (menu_entry_action()) is performed */
+   int (*entry_action)(void *userdata, menu_entry_t *entry, size_t i, enum menu_action action);
+   /* Move the list itself by the given number of mouse wheel
+    * notches, negative towards the top, leaving the selection
+    * where it is. Drivers whose list position *is* the selection
+    * leave this NULL and keep getting MENU_ACTION_UP/DOWN.
+    * Returns false when the driver cannot scroll right now. */
+   bool (*wheel_scroll)(void *userdata, int notches);
+} menu_ctx_driver_t;
+
+typedef struct
+{
+   uint64_t state;
+
+   const menu_ctx_driver_t *driver_ctx;
+   void *userdata;
+
+   char *core_buf;
+   size_t core_len;
+
+   /* This is used for storing intermediary variables
+    * that get used later on during menu actions -
+    * for instance, selecting a shader pass for a shader
+    * slot */
+   struct
+   {
+      unsigned                unsigned_var;
+   } scratchpad;
+   unsigned rpl_entry_selection_ptr;
+   int16_t state_slot_run;
+
+#if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
+   /* Used to cache the type and directory
+    * of the last shader preset/pass loaded
+    * via the menu file browser */
+   struct
+   {
+      enum rarch_shader_type preset_type;
+      enum rarch_shader_type pass_type;
+
+      char pass_dir[DIR_MAX_LENGTH];
+      char preset_dir[DIR_MAX_LENGTH];
+      char preset_file_name[NAME_MAX_LENGTH];
+      char pass_file_name[NAME_MAX_LENGTH];
+   } last_shader_selection;
+#endif
+
+   /* Used to cache the last start content
+    * loaded via the menu file browser */
+   struct
+   {
+      char directory[DIR_MAX_LENGTH];
+      char file_name[NAME_MAX_LENGTH];
+   } last_start_content;
+
+   char menu_state_msg[MENU_LABEL_MAX_LENGTH];
+   /* A string that outlives the iteration (msg_hash's) shown in place
+    * of menu_state_msg without copying it there; NULL for the buffer */
+   const char *menu_state_text;
+   /* Scratchpad variables. These are used for instance
+    * by the filebrowser when having to store intermediary
+    * paths (subdirs/previous dirs/current dir/path, etc).
+    */
+   char deferred_path[PATH_MAX_LENGTH];
+   char scratch_buf[PATH_MAX_LENGTH];
+   char scratch2_buf[PATH_MAX_LENGTH];
+   char db_playlist_file[PATH_MAX_LENGTH];
+   char filebrowser_label[NAME_MAX_LENGTH];
+   char detect_content_path[PATH_MAX_LENGTH];
+
+   /* The Content Downloader directory the user last stepped into. */
+   char core_content_dir[NAME_MAX_LENGTH];
+
+   /* A playlist entry was run from its Load State list: the content
+    * load starts at state_slot_run (-1 for Auto). Consumed by the
+    * load it was pushed with, which may run frames later. */
+   bool state_slot_run_pending;
+
+   /* The Controllers row to put the cursor back on: a controller's
+    * row type less MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN, and one, or
+    * PLAYS_AS_ROW_HEADSET for Headset Controls (menu_displaylist.c);
+    * 0 for none. */
+   unsigned plays_as_row;
+   /* Port N Controls > Controllers as last made, N and the index of
+    * its first link, while no other list was made since; N is 0 for
+    * none. */
+   unsigned plays_as_page;
+   unsigned plays_as_rows;
+} menu_handle_t;
+
+/* The text the menu's message box shows */
+#define MENU_STATE_TEXT(menu) ((menu)->menu_state_text \
+      ? (menu)->menu_state_text : (menu)->menu_state_msg)
+
+struct menu_state
+{
+   /* Timers */
+   retro_time_t current_time_us;
+   /* Time of the input poll whose state menu_event() reads this
+    * frame, and of the poll taken for the next frame. The menu
+    * collects its input before polling, so the state it acts on is
+    * one poll old; navigation auto-repeat measures a hold between
+    * polls so that a stall after the last poll is not counted as
+    * time the button was held. */
+   retro_time_t input_time_us;
+   retro_time_t input_last_time_us;
+   menu_input_t input_state;               /* retro_time_t alignment */
+
+   /* How long a held direction has been repeating, in real time: held
+    * Left/Right on a number speeds up by it. Set by menu_event(). */
+   retro_time_t action_press_time;
+
+   /* When each controller slot last had a button pressed while a list
+    * of the controllers was shown and two connected ones shared a
+    * name; 0 for not since */
+   retro_time_t pad_pressed_us[MAX_INPUT_DEVICES];
+
+   struct menu_bind_state input_binds;     /* uint64_t alignment */
+
+   gfx_thumbnail_path_data_t *thumbnail_path_data;
+   menu_handle_t *driver_data;
+   void *userdata;
+   const menu_ctx_driver_t *driver_ctx;
+   const char **input_dialog_keyboard_buffer;
+
+   struct
+   {
+      rarch_setting_t *list_settings;
+      menu_list_t *list;
+      size_t begin;
+   } entries;
+   size_t   selection_ptr;
+   size_t   contentless_core_ptr;
+
+   /* Quick jumping indices with L/R.
+    * Rebuilt when parsing directory. */
+   struct
+   {
+      size_t   index_list[SCROLL_INDEX_SIZE];
+      unsigned index_size;
+      unsigned acceleration;
+      /* entries this frame's Up or Down moves: set by a held
+       * direction's repeat (as many as its speed made due since the last
+       * frame); 0 for a press, which moves as the acceleration says */
+      unsigned steps;
+      enum menu_scroll_mode mode;
+   } scroll;
+
+   /* unsigned alignment */
+   unsigned input_dialog_kb_idx;
+   unsigned video_screen_selected;
+   /* The slots whose rows read "Pressed", a bit each */
+   uint32_t pads_marked;
+   /* Each slot's buttons and hats down at the last scan, folded */
+   uint32_t pad_down[MAX_INPUT_DEVICES];
+   /* The slots whose axes' rest is in pad_axis_rest, a bit each */
+   uint32_t pad_rest_known;
+   menu_dialog_t dialog_st;
+   enum menu_input_dialog_kb_text_type input_dialog_kb_text_type;
+#ifdef HAVE_RUNAHEAD
+   unsigned int runahead_mode;
+#endif
+
+   /* int16_t alignment */
+   menu_input_pointer_hw_state_t input_pointer_hw_state;
+   /* Where each slot's axes were as the scan began: a trigger rests at
+    * one end, a stick in the middle */
+   int16_t pad_axis_rest[MAX_INPUT_DEVICES][INPUT_PAD_VIEW_AXES];
+   /* Each slot's axes half their range off that rest at the last scan,
+    * a bit each */
+   uint16_t pad_axis_off[MAX_INPUT_DEVICES];
+
+   uint16_t flags;
+#ifdef HAVE_OVERLAY
+   uint16_t overlay_types;
+#endif
+
+   /* When generating a menu list in menu_displaylist_build_list(),
+    * the entry with a label matching 'pending_selection' will
+    * be selected automatically */
+   char pending_selection[PATH_MAX_LENGTH];
+   /* Filled with current content path when a core calls
+    * RETRO_ENVIRONMENT_SHUTDOWN. Value is required in
+    * generic_menu_entry_action(), and must be cached
+    * since RETRO_ENVIRONMENT_SHUTDOWN will cause
+    * RARCH_PATH_CONTENT to be cleared */
+   char pending_env_shutdown_content_path[PATH_MAX_LENGTH];
+   /* Path of a configuration file whose load has been deferred
+    * (see MENU_ST_FLAG_PENDING_CONFIG_REPLACE). The actual
+    * config_replace() is performed from runloop_check_state(),
+    * never from within menu iteration */
+   char pending_config_path[PATH_MAX_LENGTH];
+
+#ifdef HAVE_MENU
+   char input_dialog_kb_label_setting[256];
+
+   /* The on-screen keyboard, which is the menu's widget: what its keys
+    * show, where its cursor is, and which page of keys is up. What it
+    * types goes to the frontend's line of text, as a hardware key's
+    * does. */
+   char *osk_grid[45];
+   int osk_ptr;
+   enum osk_type osk_idx;
+#endif
+   unsigned char kb_key_state[RETROK_LAST];
+
+   /* The entry generic_menu_iterate() looks at once a frame. Here
+    * rather than on its stack: a menu_entry_t is 3872 bytes, which put
+    * that frame at 4312 where this tree allows four thousand. One is
+    * looked at a time, on the thread that iterates. */
+   menu_entry_t iterate_entry;
+
+   /* A list of the controllers is shown and two connected ones show one
+    * name: Ozone's footer says a press finds one */
+   bool pad_find_hint;
+   /* The list on screen lists the controllers: kept while two of them
+    * show one name (menu_driver_pads_list_made()) */
+   bool pads_listed;
+   /* enum menu_frame_work: a frame with none tests this alone */
+   uint8_t frame_work;
+   /* enum menu_timedate_date_order of the host's zone, taken on the main
+    * thread when the menu opens and when Lakka's zone changes */
+   uint8_t timedate_zone_order;
+
+};
+
+typedef struct menu_content_ctx_defer_info
+{
+   void *data;
+   const char *dir;
+   const char *path;
+   const char *menu_label;
+   char *s;
+   size_t len;
+} menu_content_ctx_defer_info_t;
+
+typedef struct menu_ctx_displaylist
+{
+   menu_displaylist_info_t *info;
+   unsigned type;
+} menu_ctx_displaylist_t;
+
+typedef struct menu_ctx_environment
+{
+   void *data;
+   enum menu_environ_cb type;
+} menu_ctx_environment_t;
+
+typedef struct menu_ctx_pointer
+{
+   menu_file_list_cbs_t *cbs;
+   menu_entry_t *entry;
+   unsigned x;
+   unsigned y;
+   unsigned ptr;
+   unsigned action;
+   int retcode;
+   enum menu_input_pointer_gesture gesture;
+} menu_ctx_pointer_t;
+
+typedef struct menu_ctx_bind
+{
+   menu_file_list_cbs_t *cbs;
+   const char *path;
+   const char *label;
+   size_t idx;
+   unsigned type;
+} menu_ctx_bind_t;
+
+#if defined(HAVE_LIBRETRODB)
+typedef struct explore_state explore_state_t;
+#endif
+
+typedef struct
+{
+   char *runtime_str;
+   char *last_played_str;
+   enum contentless_core_runtime_status status;
+} contentless_core_runtime_info_t;
+
+typedef struct
+{
+   char *licenses_str;
+   contentless_core_runtime_info_t runtime;
+} contentless_core_info_entry_t;
+
+#if defined(HAVE_LIBRETRODB)
+explore_state_t *menu_explore_build_list(const char *directory_playlist,
+      const char *directory_database);
+
+/* The explore index built in resumable steps.  begin() opens the
+ * playlist directory; step() advances the build, consulting @within
+ * between work items when non-NULL (a playlist entry, an RDB item, a
+ * category sort) - returns 1 when complete, 0 when the budget ran out
+ * (call again), -1 on failure; end() returns the finished state and
+ * frees the handle; abort() abandons a build at any point.
+ * menu_explore_build_list() is begin + one unbudgeted step + end. */
+typedef struct explore_build explore_build_t;
+explore_build_t *menu_explore_build_begin(const char *directory_playlist,
+      const char *directory_database);
+int menu_explore_build_step(explore_build_t *b,
+      bool (*within)(void*), void *ud);
+explore_state_t *menu_explore_build_end(explore_build_t *b);
+void menu_explore_build_abort(explore_build_t *b);
+/* The index's identity for verification: the same collection built in
+ * one go and in steps hashes the same (NULL: the installed index); and
+ * its size (NULL: the installed index too). */
+uint32_t menu_explore_state_hash(const explore_state_t *state);
+size_t menu_explore_state_entry_count(const explore_state_t *state);
+uintptr_t menu_explore_get_entry_icon(unsigned type);
+ssize_t menu_explore_get_entry_playlist_index(unsigned type,
+      playlist_t **playlist, const struct playlist_entry **entry,
+      file_list_t *list, size_t *list_pos, size_t *list_size);
+ssize_t menu_explore_set_playlist_thumbnail(unsigned type,
+      gfx_thumbnail_path_data_t *thumbnail_path_data); /* returns list index */
+void menu_explore_push_thumbnail_match(playlist_t *playlist);
+bool menu_explore_is_content_list(void);
+void menu_explore_context_init(void);
+void menu_explore_context_deinit(void);
+void menu_explore_free_state(explore_state_t *state);
+void menu_explore_free(void);
+void menu_explore_set_state(explore_state_t *state);
+#endif
+
+const char *menu_driver_ident(void);
+
+/* Two connected controllers came to show one name, or no longer do. */
+void menu_driver_pads_alike_changed(void);
+
+/* A list was made for the screen: tested as one load while every
+ * connected controller shows a name of its own */
+void menu_driver_pads_list_made(void);
+
+bool menu_driver_ctl(enum rarch_menu_ctl_state state, void *data);
+
+void menu_driver_frame(bool menu_is_alive, video_frame_info_t *video_info);
+
+int menu_driver_deferred_push_content_list(file_list_t *list);
+
+bool menu_driver_init(bool video_is_threaded);
+
+/* Rebuilds the menu driver's GPU-side context (textures, fonts) against
+ * the running video driver, releasing the old one first. */
+void menu_driver_context_rebuild(void);
+
+retro_time_t menu_driver_get_current_time(void);
+
+/* The clock in @style with @separator, rebuilt once a second or when
+ * either changes. Returns the string, valid until the next call; its
+ * length goes in @len and in @gen a number, never zero, that moves only
+ * when the text does, either one when not NULL. Drawing thread only. */
+const char *menu_display_timedate(unsigned style, unsigned separator,
+      size_t *len, unsigned *gen);
+
+size_t menu_display_powerstate(gfx_display_ctx_powerstate_t *powerstate, char *s, size_t len);
+
+void menu_display_handle_wallpaper_upload(retro_task_t *task,
+      void *task_data,
+      void *user_data, const char *err);
+
+uintptr_t menu_contentless_cores_get_entry_icon(const char *core_id);
+void menu_contentless_cores_context_init(void);
+void menu_contentless_cores_context_deinit(void);
+void menu_contentless_cores_free(void);
+void menu_contentless_cores_set_runtime(const char *core_id,
+      const contentless_core_runtime_info_t *runtime_info);
+void menu_contentless_cores_get_info(const char *core_id,
+      const contentless_core_info_entry_t **info);
+void menu_contentless_cores_flush_runtime(void);
+
+/* Returns true if search filter is enabled
+ * for the specified menu list */
+bool menu_driver_search_filter_enabled(const char *label, unsigned type);
+
+#if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
+void menu_driver_set_last_shader_preset_path(const char *path);
+void menu_driver_set_last_shader_pass_path(const char *path);
+enum rarch_shader_type menu_driver_get_last_shader_preset_type(void);
+void menu_driver_get_last_shader_preset_path(
+      const char **directory, const char **file_name);
+void menu_driver_get_last_shader_pass_path(
+      const char **directory, const char **file_name);
+#endif
+
+void menu_driver_set_pending_selection(const char *pending_selection);
+
+struct menu_state *menu_state_get_ptr(void);
+
+/* Hands @payload (local UTF-8 paths) to the selected menu entry on
+ * the next menu frame. Any thread; takes ownership of @payload.
+ * Returns false when the menu is not open, so the caller can fall
+ * back to its own handling. */
+bool menu_driver_drop(struct string_list *payload);
+
+/* As menu_driver_drop(), for the file:// entries of a text/uri-list.
+ * Decodes @list in place. */
+bool menu_driver_drop_uri_list(char *list);
+
+int generic_menu_entry_action(void *userdata, menu_entry_t *entry, size_t i, enum menu_action action);
+
+void menu_entries_build_scroll_indices(
+      struct menu_state *menu_st,
+      file_list_t *list);
+
+/* Teardown function for the menu driver. */
+void menu_driver_destroy(
+      struct menu_state *menu_st);
+
+const menu_ctx_driver_t *menu_driver_find_driver(
+      settings_t *settings,
+      const char *prefix,
+      bool verbosity_enabled);
+
+/*
+ * This function gets called in order to process all input events
+ * for the current frame.
+ *
+ * Sends input code to menu for one frame.
+ *
+ * It uses as input the local variables 'input' and 'trigger_input'.
+ *
+ * Mouse and touch input events get processed inside this function.
+ *
+ * NOTE: 'input' and 'trigger_input' is sourced from the keyboard and/or
+ * the gamepad. It does not contain input state derived from the mouse
+ * and/or touch - this gets dealt with separately within this function.
+ *
+ * TODO/FIXME - maybe needs to be overhauled so we can send multiple
+ * events per frame if we want to, and we shouldn't send the
+ * entire button state either but do a separate event per button
+ * state.
+ */
+unsigned menu_event(
+      settings_t *settings,
+      input_bits_t *p_input,
+      input_bits_t *p_trigger_input,
+      bool display_kb);
+
+/* Gets called when we want to toggle the menu.
+ * If the menu is already running, it will be turned off.
+ * If the menu is off, then the menu will be started.
+ */
+void menu_driver_toggle(
+      void *curr_video_data,
+      void *video_driver_data,
+      menu_handle_t *menu,
+      menu_input_t *menu_input,
+      settings_t *settings,
+      bool menu_driver_alive,
+      bool overlay_alive,
+      retro_keyboard_event_t *key_event,
+      retro_keyboard_event_t *frontend_key_event,
+      bool on);
+
+/* Queue a fullscreen file-browser launch; NULL cancels it. */
+bool menu_driver_media_open(const char *path);
+/* Whether menu_driver_media_open() would take path; queues nothing. */
+bool menu_driver_media_can_open(const char *path);
+/* Startup presentation is released only by the activated fullscreen view. */
+int menu_driver_media_startup_token(void);
+void menu_driver_media_startup_ready(int token);
+
+/* Iterate the menu driver for one frame. */
+bool menu_driver_iterate(
+      struct menu_state *menu_st,
+      gfx_display_t *p_disp,
+      gfx_animation_t *p_anim,
+      settings_t *settings,
+      enum menu_action action,
+      retro_time_t current_time);
+
+void menu_display_common_image_upload(void *data,
+      void *user_data, unsigned type);
+
+size_t menu_update_fullscreen_thumbnail_label(
+      char *s, size_t len,
+      bool is_quick_menu, const char *title);
+
+bool menu_is_running_quick_menu(void);
+
+/* "Find a Button by Pressing It": waits for a button of @port's
+ * controller and puts the selection on its entry. */
+void menu_input_remap_find_begin(unsigned port);
+/* A combination's buttons set by holding them, on a screen of its own
+ * that takes the menu's input meanwhile. False if there is no such
+ * combination. */
+bool menu_input_entry_capture_begin(unsigned number);
+
+/* Settings > Input > Controllers row @row (a slot, or from
+ * MAX_INPUT_DEVICES the entry of a controller that is gone) set to
+ * player @player, 0 for Auto; the controllers are placed again. */
+void menu_input_plays_as_change(unsigned row, unsigned player);
+
+bool menu_input_key_bind_set_mode(
+      enum menu_input_binds_ctl_state state, void *data);
+
+#ifdef HAVE_RUNAHEAD
+void menu_update_runahead_mode(void);
+#endif
+
+size_t menu_playlist_random_selection(
+      size_t selection, bool is_explore_list);
+
+/* The Playlists tab's Scan: a random playlist row other than
+ * @selection. Not menu_playlist_random_selection, which picks an item
+ * inside an open playlist or Explore list. */
+size_t menu_playlists_tab_random_selection(size_t selection);
+
+const char *menu_dialog_firmware_path_line(const struct menu_state *menu_st,
+      const char *line, unsigned *state);
+/* One quad, gathered with the caller's: it opens no blend group */
+void menu_dialog_draw_path_underline(const struct menu_state *menu_st,
+      unsigned *state, const char *line, font_data_t *font,
+      gfx_display_t *p_disp, void *userdata, unsigned video_dims,
+      float x, float baseline, uint32_t color);
+/* The line, counted from 1, the heading of a box whose dialog has one
+ * (menu_dialog_t.heading) ends on once text is wrapped; 0 for a first
+ * line that is not a heading. Line ends in wrapped may be '\0'. */
+unsigned menu_dialog_rule_line(const char *text, const char *wrapped,
+      size_t wrapped_len, unsigned line_count);
+
+void menu_dialog_confirm_set(struct menu_state *menu_st,
+      unsigned msg, unsigned cmd);
+void menu_dialog_confirm_clear(struct menu_state *menu_st);
+
+enum menu_dialog_icon
+{
+   MENU_DIALOG_ICON_NONE = 0,
+   MENU_DIALOG_ICON_CANCEL,
+   MENU_DIALOG_ICON_OK,
+   MENU_DIALOG_ICON_OK_DIM
+};
+
+typedef struct menu_dialog_buttons
+{
+   unsigned label[MENU_DIALOG_BUTTONS_MAX]; /* enum msg_hash_enums */
+   unsigned count;   /* 0: no confirm is up */
+   int highlight;    /* -1: none */
+   int hover;        /* -1: none */
+   uint8_t icon[MENU_DIALOG_BUTTONS_MAX];   /* enum menu_dialog_icon */
+   bool classic;     /* Cancel and OK */
+} menu_dialog_buttons_t;
+
+/* The confirm box's buttons, left to right. Only for the code that
+ * draws the box: it marks that box drawn for menu_dialog_set_hover() */
+void menu_dialog_get_buttons(struct menu_state *menu_st,
+      menu_dialog_buttons_t *b);
+/* The button under the pointer, -1 for none: drivers set it as they
+ * draw the box from menu_dialog_get_buttons() */
+void menu_dialog_set_hover(struct menu_state *menu_st, int idx);
+/* Places a row of buttons w wide, gap apart, in a box: the first at
+ * its left edge, the last at its right, the spare width shared out
+ * between them; one alone in the middle. Fills x unless it is NULL.
+ * Returns the width the row needs. */
+int menu_dialog_buttons_layout(const int *w, unsigned count, int gap,
+      int box_x, int box_w, int *x);
+
+/* Whether text, len long, is the input dialog's: label and the typed
+ * str (" " for none) on lines of their own. Lets a driver draw text
+ * it kept instead of joining them again every frame. */
+bool menu_input_dialog_text_is(const char *text, size_t len,
+      const char *label, const char *str);
+
+/* A box's button labels as last measured, kept by the driver on the
+ * thread that draws the box */
+typedef struct menu_dialog_label_widths
+{
+   const char *str[MENU_DIALOG_BUTTONS_MAX];
+   int w[MENU_DIALOG_BUTTONS_MAX];
+   font_data_t *font;
+   float size;
+   uint32_t font_generation;
+   unsigned count;
+} menu_dialog_label_widths_t;
+
+/* The width of each button's label in font, which the driver draws at
+ * size, in c: measured again only for a label, the language or the font
+ * that changed since c was filled */
+const int *menu_dialog_label_widths(menu_dialog_label_widths_t *c,
+      const menu_dialog_buttons_t *b, font_data_t *font, float size);
+/* False when the driver shows no screens (null) */
+bool menu_core_warning_can_open(void);
+#ifdef HAVE_CORE_SIGNATURES
+/* Raises the Security Warning's box for the request pending, or takes
+ * it down when none is; true on the frame it went up */
+bool menu_core_warning_iterate(struct menu_state *menu_st);
+#endif
+
+#if defined(HAVE_ONLINE_UPDATER) && defined(HAVE_NETWORKING) && defined(HAVE_COMPRESSION) && defined(HAVE_CONFIGFILE)
+void menu_first_run_download_start(void);
+#endif
+void menu_dialog_confirm(struct menu_state *menu_st);
+
+extern const menu_ctx_driver_t *menu_ctx_drivers[];
+
+extern menu_ctx_driver_t menu_ctx_ozone;
+extern menu_ctx_driver_t menu_ctx_rgui;
+extern menu_ctx_driver_t menu_ctx_mui;
+extern menu_ctx_driver_t menu_ctx_xmb;
+
+/* The camera preview. A menu driver shows it in a thumbnail of its own
+ * while menu_camera_preview_selected(), calling
+ * menu_camera_preview_frame() with that thumbnail every frame it is
+ * shown, and resets the thumbnail when it stops showing it, which
+ * closes the camera. The state says what, if anything, the thumbnail
+ * is receiving. */
+bool menu_camera_preview_selected(void);
+enum camera_preview_state menu_camera_preview_frame(gfx_thumbnail_t *thumbnail);
+void menu_camera_preview_stop(void);
+/* For a driver with a sink of its own (camera_driver_preview_open):
+ * polls the preview and tells the user once of a state that shows no
+ * picture. */
+enum camera_preview_state menu_camera_preview_poll(void);
+/* The two together, for a driver drawing with gfx_display: _update
+ * each frame, true while the preview is to be drawn (and the
+ * thumbnail reset once it is not); _draw a black box of @dims at
+ * @x, @y with the picture fitted in it. */
+bool menu_camera_preview_update(gfx_thumbnail_t *thumbnail);
+void menu_camera_preview_draw(gfx_thumbnail_t *thumbnail, void *userdata,
+      unsigned video_dims, float x, float y, unsigned dims);
+
+RETRO_END_DECLS
+
+#endif

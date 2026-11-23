@@ -1,0 +1,58 @@
+/* Single-source definitions: stereo 3D and screens group.
+ * Grammar identical to settings_def_video_sync.h plus S_FLOAT and
+ * the _NS no-sublabel variants; the descriptor argument span
+ * matches SDESC_<kind>_ROW; row order is menu display order;
+ * h2json.py parses these rows for the Crowdin source upload. */
+
+S_ACTION(VIDEO_STEREO_SETTINGS,
+      "video_stereo_settings",
+      "Stereo 3D",
+      "Change how stereo 3D from cores that support it is shown.")
+S_UINT_EX(video_stereo_mode, VIDEO_STEREO_MODE,
+      "video_stereo_mode",
+      0, SD_FLAG_NONE, SDESC_RANGE_MINMAX, 0, 0, 5, 1, 0, setting_action_ok_uint, setting_get_string_representation_video_stereo_mode, NULL, NULL, NULL, NULL, ST_UI_TYPE_UINT_COMBOBOX,
+      "Stereo Mode",
+      "How to show both eyes of stereo 3D content. 2D shows the left eye only. Side by Side (Full) suits headset viewer apps and cross-eyed viewing; Side by Side (Half) and Top-Bottom suit 3D TVs.")
+S_BOOL(video_stereo_swap_eyes, VIDEO_STEREO_SWAP_EYES,
+      "video_stereo_swap_eyes",
+      false, SD_FLAG_NONE, 0, 0,
+      "Swap Eyes",
+      "Exchange the left and right eye images. Use for cross-eyed viewing, or when a display shows the eyes or rows reversed.")
+S_ACTION(VIDEO_GAME_SCREENS_SETTINGS,
+      "video_game_screens_settings",
+      "Game Screens",
+      "Arrange the screens of cores that have more than one, and choose where each appears.")
+S_UINT_EX(video_screen_layout, VIDEO_SCREEN_LAYOUT,
+      "video_screen_layout",
+      0, SD_FLAG_NONE, SDESC_RANGE_MINMAX, 0, 0, 1, 1, 0, setting_action_ok_uint, setting_get_string_representation_video_screen_layout, NULL, NULL, NULL, NULL, ST_UI_TYPE_UINT_COMBOBOX,
+      "Screen Layout",
+      "How to arrange the screens of multi-screen systems.")
+#if defined(HAVE_VIDEO_WINDOWS) || defined(SETTINGS_DEF_STRINGS_PASS)
+S_BOOL(video_windows_enable, VIDEO_WINDOWS_ENABLE,
+      "video_windows_enable",
+      DEFAULT_VIDEO_WINDOWS_ENABLE, SD_FLAG_NONE, SDESC_FLG_REFRESH, 0,
+      "Separate Screen Windows",
+      "Allow secondary screens to use separate desktop windows.")
+S_UINT_EX(video_menu_follows, VIDEO_MENU_FOLLOWS,
+      "video_menu_follows",
+      0, SD_FLAG_NONE, SDESC_RANGE_MINMAX, 0, 0, VIDEO_MENU_FOLLOWS_SEPARATE, 1, 0, setting_action_ok_uint, setting_get_string_representation_video_menu_follows, NULL, NULL, setting_uint_action_left_video_menu_follows, setting_uint_action_right_video_menu_follows, ST_UI_TYPE_UINT_COMBOBOX,
+      "Menu Follows",
+      "Puts the menu on this game screen's display, with or without a game. Separate gives it a display of its own.")
+S_UINT_EX(video_notifications_window, VIDEO_NOTIFICATIONS_WINDOW,
+      "video_notifications_window",
+      0, SD_FLAG_NONE, SDESC_RANGE_MINMAX, 0, 0, 1, 1, 0, setting_action_ok_uint, setting_get_string_representation_video_notifications_window, NULL, NULL, NULL, NULL, ST_UI_TYPE_UINT_COMBOBOX,
+      "Notifications",
+      "Where notifications appear when the menu is on another display than the game.")
+S_ACTION_EX(VIDEO_SCREEN_WINDOWS_RESTORE,
+      "video_screen_windows_restore", SD_FLAG_NONE, setting_action_video_screen_windows_restore, NULL, 0,
+      "Restore Screen Windows",
+      "Reopen screen windows closed from their title bar, at their saved size and position, when the game resumes.")
+
+#if defined(ANDROID) || defined(SETTINGS_DEF_STRINGS_PASS)
+S_UINT_EX(video_blank_unused_screens, VIDEO_BLANK_UNUSED_SCREENS,
+      "video_blank_unused_screens",
+      0, SD_FLAG_NONE, SDESC_RANGE_MINMAX, 0, 0, 2, 1, 0, setting_action_ok_uint, setting_get_string_representation_video_blank_unused_screens, NULL, NULL, NULL, NULL, ST_UI_TYPE_UINT_COMBOBOX,
+      "Blank Unused Screens",
+      "Cover built-in screens RetroArch isn't using with black. The screen is not switched off, so it saves power on OLED panels only. External displays are left alone, and Android's main screen can't be covered. Needs Android 12 or later.")
+#endif
+#endif

@@ -1,0 +1,89 @@
+#!/bin/sh
+# Asserts that the seqlock in retro_atomic_test.c lowers to real
+# barriers on a weakly-ordered target.
+#
+# A host run cannot check this.  On x86_64 the hardware supplies the
+# ordering the code forgot to ask for, and qemu-aarch64 does not model
+# reordering either: building this file with the release fence deleted
+# still passes under both.  What does change is the emitted code, so
+# that is what this checks.
+#
+# Expected, with the seqlock written as it is:
+#
+#   seqlock_writer  dmb ish    the release fence between the odd stamp
+#                              and the field stores
+#                   stlr       the two stamps (plus writer_done)
+#                   str        the fields, relaxed, no barrier
+#   seqlock_reader  dmb ishld  the acquire fence after the field loads
+#                   ldar       the two stamp reads
+#                   ldr        the fields, relaxed, no barrier
+#
+# Skips cleanly when no aarch64 cross compiler is installed, so it can
+# sit in a workflow that also runs on machines without one.
+
+CROSS=${CROSS:-aarch64-linux-gnu}
+CC_X=$CROSS-gcc
+OBJDUMP=$CROSS-objdump
+HERE=$(dirname "$0")
+OBJ=$(mktemp /tmp/retro_atomic_barriers.XXXXXX.o)
+rc=0
+
+if ! command -v "$CC_X" >/dev/null 2>&1 || ! command -v "$OBJDUMP" >/dev/null 2>&1; then
+   echo "skip  barrier check: no $CROSS toolchain"
+   rm -f "$OBJ"
+   exit 0
+fi
+
+if ! "$CC_X" -std=gnu99 -O2 -DHAVE_THREADS \
+      -I"$HERE/../../../include" -c "$HERE/retro_atomic_test.c" -o "$OBJ"; then
+   echo "FAIL  barrier check: cross compile failed"
+   rm -f "$OBJ"
+   exit 1
+fi
+
+want() { # function, instruction, human name
+   n=$("$OBJDUMP" -d "$OBJ" --disassemble="$1" 2>/dev/null \
+         | grep -cE "[[:space:]]$2([[:space:]]|$)")
+   if [ "$n" -lt 1 ]; then
+      echo "FAIL  $1: no $3 ($2) in the emitted code"
+      rc=1
+   else
+      echo "ok    $1: $3"
+   fi
+}
+
+want seqlock_writer "dmb"  "release fence"
+want seqlock_writer "stlr" "release stores for the stamps"
+want seqlock_writer "str"  "plain stores for the relaxed fields"
+want seqlock_reader "dmb"  "acquire fence"
+want seqlock_reader "ldar" "acquire loads for the stamps"
+want seqlock_reader "ldr"  "plain loads for the relaxed fields"
+
+# The acq_rel fence is one full barrier, not an acquire and a release
+n=$("$OBJDUMP" -d "$OBJ" --disassemble=acq_rel_fence_shape 2>/dev/null | grep -cE "[[:space:]]dmb[[:space:]]+ish$")
+m=$("$OBJDUMP" -d "$OBJ" --disassemble=acq_rel_fence_shape 2>/dev/null | grep -cE "[[:space:]]dmb[[:space:]]")
+if [ "$n" -ne 1 ] || [ "$m" -ne 1 ]; then
+   echo "FAIL  acq_rel_fence_shape: $m barriers, $n of them a full dmb ish - want exactly one"
+   rc=1
+else
+   echo "ok    acq_rel_fence_shape: one dmb ish"
+fi
+
+# The 128-bit release store is one exclusive-pair loop: LDXP then STLXP,
+# with no compare of a value read before it
+dis=$("$OBJDUMP" -d "$OBJ" --disassemble=store_128_shape 2>/dev/null)
+if ! echo "$dis" | grep -q "stlxp" || echo "$dis" | grep -qE "[[:space:]](cmp|ccmp)[[:space:]]"; then
+   echo "FAIL  store_128_shape: want an ldxp/stlxp loop with no compare"
+   rc=1
+else
+   echo "ok    store_128_shape: ldxp/stlxp, no compare"
+fi
+
+# Bytes and halfwords: one acquire load or release store of their width
+want load_acquire_8_shape   "ldarb" "an acquire byte load"
+want store_release_8_shape  "stlrb" "a release byte store"
+want load_acquire_16_shape  "ldarh" "an acquire halfword load"
+want store_release_16_shape "stlrh" "a release halfword store"
+
+rm -f "$OBJ"
+exit $rc

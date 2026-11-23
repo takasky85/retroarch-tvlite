@@ -1,0 +1,162 @@
+/* Copyright  (C) 2010-2020 The RetroArch team
+ *
+ * ---------------------------------------------------------------------------------------
+ * The following license statement only applies to this file (nearest_resampler.c).
+ * ---------------------------------------------------------------------------------------
+ *
+ * Permission is hereby granted, free of charge,
+ * to any person obtaining a copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation the rights to
+ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+ * and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <float.h>
+
+#include <audio/audio_resampler.h>
+
+typedef struct rarch_nearest_resampler
+{
+   float fraction;
+} rarch_nearest_resampler_t;
+
+/* The step is 1/ratio, so a ratio that is not positive, or larger than
+ * a pair of sample rates can name, leaves the inner loop emitting past
+ * data_out rather than advancing. */
+#define NEAREST_RATIO_MAX 65536.0
+
+static void resampler_nearest_process(
+      void *re_, struct resampler_data *data)
+{
+   rarch_nearest_resampler_t *re = (rarch_nearest_resampler_t*)re_;
+   audio_frame_float_t  *inp     = (audio_frame_float_t*)data->data_in;
+   audio_frame_float_t  *inp_max = (audio_frame_float_t*)inp + data->input_frames;
+   audio_frame_float_t  *outp    = (audio_frame_float_t*)data->data_out;
+   float                   ratio;
+
+   if (!(data->ratio > 0.0) || !(data->ratio <= NEAREST_RATIO_MAX))
+   {
+      data->output_frames = 0;
+      return;
+   }
+   ratio = 1.0 / data->ratio;
+
+   while (inp != inp_max)
+   {
+      while (re->fraction > 1)
+      {
+         *outp++       = *inp;
+         re->fraction -= ratio;
+      }
+      re->fraction++;
+      inp++;
+   }
+
+   data->output_frames = (outp - (audio_frame_float_t*)data->data_out);
+}
+
+static void resampler_nearest_free(void *re_)
+{
+   rarch_nearest_resampler_t *re = (rarch_nearest_resampler_t*)re_;
+   if (re)
+      free(re);
+}
+
+static void *resampler_nearest_init(const struct resampler_config *config,
+      double bandwidth_mod,
+      enum resampler_quality quality,
+      resampler_simd_mask_t mask)
+{
+   rarch_nearest_resampler_t *re = (rarch_nearest_resampler_t*)
+      calloc(1, sizeof(rarch_nearest_resampler_t));
+   if (!re)
+      return NULL;
+   re->fraction = 0;
+   return re;
+}
+
+static void resampler_nearest_reset(void *re_)
+{
+   rarch_nearest_resampler_t *re = (rarch_nearest_resampler_t*)re_;
+   if (re)
+      re->fraction = 0;
+}
+
+static size_t resampler_nearest_state(void *re_, void *buf, size_t len,
+      int write)
+{
+   rarch_nearest_resampler_t *re = (rarch_nearest_resampler_t*)re_;
+   if (!re)
+      return 0;
+   if (!buf)
+      return sizeof(re->fraction);
+   if (len != sizeof(re->fraction))
+      return 0;
+   if (write)
+      memcpy(&re->fraction, buf, sizeof(re->fraction));
+   else
+      memcpy(buf, &re->fraction, sizeof(re->fraction));
+   return sizeof(re->fraction);
+}
+
+/* process()'s clock run without the copies. Exact only where float
+ * arithmetic is: a build that keeps floats wider or reorders them could
+ * land a step on the other side of 1, so it answers 0 for the bound. */
+static size_t resampler_nearest_fit(void *re_, double ratio_d,
+      size_t max_output, size_t max_input)
+{
+#if (defined(FLT_EVAL_METHOD) && FLT_EVAL_METHOD != 0) || defined(__FAST_MATH__)
+   (void)re_; (void)ratio_d; (void)max_output; (void)max_input;
+   return 0;
+#else
+   rarch_nearest_resampler_t *re = (rarch_nearest_resampler_t*)re_;
+   float  ratio, fraction;
+   size_t in, out = 0;
+
+   if (!re || !(ratio_d > 0.0) || !(ratio_d <= NEAREST_RATIO_MAX))
+      return 0;
+   ratio    = 1.0 / ratio_d;
+   fraction = re->fraction;
+   for (in = 0; in < max_input; in++)
+   {
+      size_t emit = 0;
+      while (fraction > 1)
+      {
+         emit++;
+         fraction -= ratio;
+      }
+      if (out + emit > max_output)
+         break;
+      out += emit;
+      fraction++;
+   }
+   return in;
+#endif
+}
+
+retro_resampler_t nearest_resampler = {
+   resampler_nearest_init,
+   resampler_nearest_process,
+   resampler_nearest_free,
+   RESAMPLER_API_VERSION,
+   "nearest",
+   "nearest",
+   resampler_nearest_reset,
+   0,
+   NULL,
+   resampler_nearest_fit,
+   resampler_nearest_state
+};

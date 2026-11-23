@@ -1,0 +1,485 @@
+include ../../sample_objdir.mk
+
+TARGET      := vfs_read_overflow_test
+TARGET_TEST := vfs_mapped_ptr_test
+TARGET_TEST2 := vfs_large_file_test
+TARGET_TEST3 := vfs_seek_contract_test
+TARGET_TEST4 := vfs_bulk_read_test
+TARGET_TEST5 := filestream_rbuf_fault_test
+TARGET_TEST6 := vfs_v5_metadata_test
+TARGET_TEST7 := vfs_rename_replace_test
+TARGET_TEST8 := vfs_prefetch_test
+TARGET_TEST9 := vfs_readahead_test
+TARGET_TEST10 := vfs_view_test
+TARGET_TEST11 := vfs_prefetch_offthread_test
+TARGET_TEST12 := vfs_close_result_test
+TARGET_TEST13 := vfs_descriptor_rw_test
+TARGET_TEST14 := vfs_positional_test
+TARGET_TEST15 := vfs_positional_nommap_test
+TARGET_TEST16 := vfs_positional_off32_test
+TARGET_TEST17 := vfs_positional_pathreopen_test
+TARGET_TEST18 := vfs_positional_ntverify_test
+TARGET_TEST19 := vfs_positional_wide_test
+TARGET_TEST20 := vfs_seek_read_mix_test
+TARGET_TEST21 := vfs_write_mix_test
+TARGET_TEST22 := vfs_stable_test
+TARGET_TEST23 := vfs_size_contract_test
+TARGET_TEST24 := vfs_positional_size_test
+TARGET_TEST25 := vfs_header_hygiene_test
+BENCH_CRT     := vfs_native_bench
+BENCH_NATIVE  := vfs_native_bench_native
+
+LIBRETRO_COMM_DIR := ../../..
+
+COMMON_SOURCES := \
+	$(LIBRETRO_COMM_DIR)/compat/fopen_utf8.c \
+	$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
+	$(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
+	$(LIBRETRO_COMM_DIR)/file/file_path.c \
+	$(LIBRETRO_COMM_DIR)/file/file_path_io.c \
+	$(LIBRETRO_COMM_DIR)/file/retro_dirent.c \
+	$(LIBRETRO_COMM_DIR)/streams/file_stream.c \
+	$(LIBRETRO_COMM_DIR)/string/rstrtod.c \
+	$(LIBRETRO_COMM_DIR)/time/rtime.c \
+	$(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+
+COMMON_OBJS := $(call sample_objs,$(COMMON_SOURCES:.c=.o))
+OBJS        := vfs_read_overflow_test.o vfs_mapped_ptr_test.o \
+	vfs_large_file_test.o vfs_seek_contract_test.o \
+	vfs_bulk_read_test.o filestream_rbuf_fault_test.o \
+	vfs_v5_metadata_test.o vfs_rename_replace_test.o \
+	vfs_prefetch_test.o vfs_readahead_test.o vfs_view_test.o \
+	vfs_prefetch_offthread_test.o vfs_close_result_test.o \
+	vfs_descriptor_rw_test.o vfs_positional_test.o \
+	vfs_positional_off32_test.o $(COMMON_OBJS)
+
+# vfs_view_test also hashes through sha1_calculate(), whose dispatch
+# asks features_cpu.c what the CPU has.
+VIEW_OBJS := $(COMMON_OBJS) \
+	$(call sample_objs,$(LIBRETRO_COMM_DIR)/hash/lrc_hash.o \
+	$(LIBRETRO_COMM_DIR)/features/features_cpu.o)
+
+# filestream_rbuf_fault_test drives the two arms on which
+# filestream_rbuf_fill() gives up and hands the caller back to the
+# byte-at-a-time path.  The tell arm needs nothing from the
+# implementation - filestream_vfs_init() is seam enough - but a refused
+# allocation has no other way in, so that one target links its own
+# file_stream.o with FILESTREAM_RBUF_MALLOC pointed at its fault
+# allocator.  Scoped to this object and no further: every other target
+# here, and every build in the tree, links the unmodified unit with
+# plain malloc() and no added symbol or branch.
+FAULT_FS_OBJ := file_stream_rbuf_fault.o
+FAULT_OBJS   := $(filter-out %/file_stream.o,$(COMMON_OBJS)) \
+	$(FAULT_FS_OBJ)
+
+# vfs_readahead_test needs the read-ahead thread, so that one target
+# links a vfs_implementation.o built with HAVE_THREADS and the threads.
+RA_VFS_OBJ := vfs_implementation_threads.o
+RA_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(RA_VFS_OBJ) rthreads_ra.o retro_eventcount_ra.o
+ifeq ($(UNAME_S),Linux)
+   RA_LIBS := -lpthread
+endif
+
+# vfs_prefetch_offthread_test links its own vfs_implementation.o, built
+# with the read-ahead thread and VFS_WIN32_PREFETCH_HOOK pointed at the
+# test's slow stand-in for PrefetchVirtualMemory. Scoped to this object:
+# every other build calls the real function.
+HOOK_VFS_OBJ := vfs_implementation_prefetch_hook.o
+HOOK_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(HOOK_VFS_OBJ) rthreads_ra.o retro_eventcount_ra.o
+
+# vfs_rename_replace_test runs the replace-on-rename branch the consoles
+# take, so that one target links its own vfs_implementation.o built
+# with -DGEKKO (and, like GameCube and Wii, no mmap), and wraps
+# rename/remove/stat to refuse a rename onto an existing name as those
+# filesystems do.
+RENAME_VFS_OBJ := vfs_implementation_gekko.o
+RENAME_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(RENAME_VFS_OBJ)
+
+# vfs_close_result_test runs the descriptor path PS2 takes for whole-file
+# reads and writes, so that one target links its own
+# vfs_implementation.o built with -DPS2 (no mmap there either), with
+# every close() in it routed through the test's stand-in for ps2sdk's,
+# which reports the descriptor number on success.
+CLOSE_VFS_OBJ := vfs_implementation_close_hook.o
+CLOSE_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(CLOSE_VFS_OBJ)
+
+# -DHAVE_MMAP is required for vfs_read_overflow_test to exercise the
+# patched code path; without it the implementation falls back to
+# buffered fread and that test becomes a smoke test that can't
+# discriminate the overflow case.
+#
+# vfs_mapped_ptr_test needs BOTH settings to be meaningful, which is
+# why this is a variable rather than a fixed flag.  With mappings on,
+# filestream_matches_buf() compares against the map and its windowed
+# fallback never runs - so the window-boundary cases would be
+# asserting on code that was not executed.  Build with MMAP=0 to put
+# that path under test; the test reports which one it took.
+# Windows has no <sys/mman.h>.  The Win32 file-mapping backend is
+# picked up from _WIN32 inside vfs.h and needs no flag here, so
+# default this off there rather than leave a plain `make` in an MSYS2
+# shell failing on a missing POSIX header.
+UNAME_S := $(shell uname -s 2>/dev/null)
+ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(UNAME_S)))
+   MMAP ?= 0
+   $(call sample_objs,$(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.o): CFLAGS += -Wframe-larger-than=2048 -Werror=frame-larger-than=2048
+else
+   MMAP ?= 1
+endif
+ifeq ($(MMAP),1)
+   CFLAGS += -DHAVE_MMAP
+endif
+# As RetroArch's Makefile builds Linux: what glibc declares only under it
+# (fallocate's hole punching) is what a frontend runs
+ifeq ($(UNAME_S),Linux)
+   CFLAGS += -D_GNU_SOURCE
+endif
+
+# vfs_bulk_read_test asserts which I/O path an open lands on, and the
+# interesting configuration - descriptor I/O with no file mapping - is
+# the one the consoles have and no desktop does.  Build
+# 'make MMAP=0 DESCRIPTOR_IO=1' to reproduce it here; MMAP=0 on its
+# own gives the other case, a target that is on neither list and must
+# keep its buffered behaviour unchanged.
+DESCRIPTOR_IO ?=
+ifeq ($(DESCRIPTOR_IO),1)
+   CFLAGS += -DVFS_HAVE_DESCRIPTOR_IO=1
+endif
+
+# 'make VFS_NATIVE=0' builds the suite with Windows streams on the C
+# runtime (VFS_WIN32_NO_NATIVE) rather than a handle of their own;
+# elsewhere it changes nothing.
+VFS_NATIVE ?=
+ifeq ($(VFS_NATIVE),0)
+   CFLAGS += -DVFS_WIN32_NO_NATIVE
+endif
+
+# FAKE_CFR=1 stands in a copy_file_range that copies to EOF whatever
+# len it was given (what gVisor was observed doing); FAKE_CFR=2 one
+# that copies three times len.  Both exercise vfs_v5_metadata_test's
+# distrust-and-resume path on a kernel that would never trip it.
+ifneq ($(FAKE_CFR),)
+   CFLAGS += -DVFS_COPY_TEST_FAKE_CFR=$(FAKE_CFR)
+endif
+# Every sample build narrates the copy stepper's platform calls on
+# stderr (which path, what was asked, what came back); a frontend
+# build never defines this.
+CFLAGS += -DVFS_COPY_DEBUG
+CFLAGS += -Wall -pedantic -std=gnu99 -g1 -I$(LIBRETRO_COMM_DIR)/include
+
+# The samples workflow passes SANITIZER=address,undefined to every
+# sample dir; without this block the variable was silently ignored
+# here, so these two ran unchecked while the rest of the tree did not.
+ifneq ($(SANITIZER),)
+   CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
+   LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
+endif
+
+# --wrap is a GNU ld option, and on a Windows host the _WIN32 rename
+# branch would be compiled ahead of the GEKKO one, so the console
+# rename target is built on Linux only.
+ifeq ($(UNAME_S),Linux)
+   RENAME_TARGET := $(TARGET_TEST7)
+endif
+
+all: $(TARGET) $(TARGET_TEST) $(TARGET_TEST2) $(TARGET_TEST3) $(TARGET_TEST4) \
+	$(TARGET_TEST5) $(TARGET_TEST6) $(TARGET_TEST8) $(TARGET_TEST9) \
+	$(TARGET_TEST10) $(TARGET_TEST11) $(TARGET_TEST12) $(TARGET_TEST13) \
+	$(TARGET_TEST14) $(TARGET_TEST15) $(TARGET_TEST16) $(TARGET_TEST17) \
+	$(TARGET_TEST18) $(TARGET_TEST19) $(TARGET_TEST20) $(TARGET_TEST21) $(TARGET_TEST22) $(TARGET_TEST23) $(TARGET_TEST24) $(TARGET_TEST25) $(BENCH_CRT) $(BENCH_NATIVE) \
+	$(RENAME_TARGET)
+
+%.o: %.c
+	$(CC) -c -o $@ $< $(CFLAGS)
+
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
+	$(CC) -c -o $@ $< $(CFLAGS)
+
+$(TARGET): vfs_read_overflow_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST): vfs_mapped_ptr_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST8): vfs_prefetch_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST13): vfs_descriptor_rw_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST14): vfs_positional_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -lpthread
+
+# vfs_positional_nommap_test: the same test against a
+# vfs_implementation.o built without HAVE_MMAP, as Android's is, where
+# a Unix host must still read and write at offsets (pread/pwrite) - a
+# -1 there fails rather than skips.
+NOMMAP_VFS_OBJ := vfs_implementation_nommap.o
+NOMMAP_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(NOMMAP_VFS_OBJ)
+
+$(NOMMAP_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(filter-out -DHAVE_MMAP,$(CFLAGS))
+
+vfs_positional_required.o: vfs_positional_test.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_POSITIONAL_TEST_REQUIRED
+
+$(TARGET_TEST15): vfs_positional_required.o $(NOMMAP_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -lpthread
+
+# vfs_positional_off32_test links a vfs_implementation.o whose
+# positional offsets go through a 32-bit type, as off_t is on 32-bit
+# Linux and older 32-bit Android, so the refusal past 4 GiB is held on
+# a 64-bit host. Scoped to this object.
+OFF32_VFS_OBJ := vfs_implementation_off32.o
+OFF32_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(OFF32_VFS_OBJ)
+
+$(OFF32_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_POSITIONAL_OFF_T=int32_t
+
+$(TARGET_TEST16): vfs_positional_off32_test.o $(OFF32_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+# vfs_positional_pathreopen_test: on Windows, the second handle made
+# the way NT before Vista makes it - the stream's path opened again and
+# checked against the handle - rather than with ReOpenFile. Elsewhere
+# the define changes nothing. Scoped to this object.
+PATHREOPEN_VFS_OBJ := vfs_implementation_pathreopen.o
+PATHREOPEN_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(PATHREOPEN_VFS_OBJ)
+
+$(PATHREOPEN_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_WIN32_FORCE_PATH_REOPEN
+
+$(TARGET_TEST17): vfs_positional_required.o $(PATHREOPEN_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -lpthread
+
+# vfs_positional_ntverify_test: on Windows, the handle opened relative
+# to the stream's checked against it as NT before Vista has it checked,
+# whatever version runs it. Elsewhere the define changes nothing.
+NTVERIFY_VFS_OBJ := vfs_implementation_ntverify.o
+NTVERIFY_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(NTVERIFY_VFS_OBJ)
+
+$(NTVERIFY_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_WIN32_ALWAYS_VERIFY
+
+$(TARGET_TEST18): vfs_positional_required.o $(NTVERIFY_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -lpthread
+
+# vfs_positional_wide_test: the positional test from twelve threads
+vfs_positional_wide.o: vfs_positional_test.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_POSITIONAL_TEST_REQUIRED -DTHREADS=12
+
+$(TARGET_TEST19): vfs_positional_wide.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -lpthread
+
+$(TARGET_TEST20): vfs_seek_read_mix_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST21): vfs_write_mix_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST22): vfs_stable_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST23): vfs_size_contract_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST24): vfs_positional_size_test.o $(COMMON_OBJS) \
+	rthreads_ra.o retro_eventcount_ra.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST25): vfs_header_hygiene_test.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+# vfs_native_bench / vfs_native_bench_native: read-only stream timings
+# through the C runtime (VFS_WIN32_NO_NATIVE), and through the stream's
+# own handle - run both on Windows and compare. Elsewhere the two are
+# the same build.
+CRT_VFS_OBJ := vfs_implementation_crt.o
+BENCH_OBJS  := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	rthreads_ra.o retro_eventcount_ra.o
+
+$(CRT_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_WIN32_NO_NATIVE
+
+vfs_native_bench_crt.o: vfs_native_bench.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_WIN32_NO_NATIVE
+
+$(BENCH_CRT): vfs_native_bench_crt.o $(BENCH_OBJS) $(CRT_VFS_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS) $(RA_LIBS) -lpthread
+
+$(BENCH_NATIVE): vfs_native_bench.o $(COMMON_OBJS) rthreads_ra.o retro_eventcount_ra.o
+	$(CC) -o $@ $^ $(LDFLAGS) $(RA_LIBS) -lpthread
+
+$(TARGET_TEST10): vfs_view_test.o $(VIEW_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(RA_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DHAVE_THREADS
+
+rthreads_ra.o: $(LIBRETRO_COMM_DIR)/rthreads/rthreads.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DHAVE_THREADS
+
+retro_eventcount_ra.o: $(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DHAVE_THREADS
+
+$(TARGET_TEST9): vfs_readahead_test.o $(RA_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) $(RA_LIBS)
+
+$(HOOK_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c prefetch_hook.h
+	$(CC) -c -o $@ $< $(CFLAGS) -DHAVE_THREADS -I. -include prefetch_hook.h \
+		-DVFS_WIN32_PREFETCH_HOOK=vfs_prefetch_test_hook
+
+$(TARGET_TEST11): vfs_prefetch_offthread_test.o $(HOOK_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) $(RA_LIBS)
+
+# vfs_large_file_test builds sparse fixtures of 3 GiB and 5 GiB.  They
+# cost no space on a filesystem with sparse files and are removed
+# afterwards; where the filesystem cannot hold them the test skips.
+$(TARGET_TEST2): vfs_large_file_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+# vfs_seek_contract_test runs its contract checks on a 4 KiB fixture
+# first, so a machine that cannot hold the 4 GiB one still tests the
+# properties instead of skipping the run.
+$(TARGET_TEST3): vfs_seek_contract_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+# vfs_bulk_read_test covers filestream_read_file() and the descriptor
+# path RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK selects.  It spawns
+# threads to check that whole-file reads hold no shared state, so it
+# is the one target here that needs -lpthread; that also makes it the
+# one worth running under SANITIZER=thread.
+$(TARGET_TEST4): vfs_bulk_read_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -lpthread
+
+$(FAULT_FS_OBJ): $(LIBRETRO_COMM_DIR)/streams/file_stream.c \
+		rbuf_fault_hooks.h
+	$(CC) -c -o $@ $< $(CFLAGS) -I. -include rbuf_fault_hooks.h \
+		-DFILESTREAM_RBUF_MALLOC=filestream_rbuf_fault_malloc
+
+# filestream_rbuf_fault_test installs its own VFS, which takes the
+# memory mapping out of play, so it behaves identically with MMAP=1 and
+# MMAP=0 and there is nothing to gain from running it in both lanes.
+$(TARGET_TEST5): filestream_rbuf_fault_test.o $(FAULT_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+# vfs_v5_metadata_test covers the VFS API v5 additions (read-only
+# state, mtime, begin/step/close copy, dirent_stat) through the path_*,
+# filestream_copy* and retro_dirent_stat wrappers.  The copy is a
+# caller-stepped state machine: no threads, no extra objects.
+$(TARGET_TEST6): vfs_v5_metadata_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(RENAME_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(filter-out -DHAVE_MMAP,$(CFLAGS)) -DGEKKO
+
+$(TARGET_TEST7): vfs_rename_replace_test.o $(RENAME_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=rename,--wrap=remove,--wrap=stat
+
+$(CLOSE_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c close_hook.h
+	$(CC) -c -o $@ $< $(filter-out -DHAVE_MMAP,$(CFLAGS)) -DPS2 \
+		-DRETRO_ATOMIC_FORCE_VOLATILE -I. -include close_hook.h
+
+$(TARGET_TEST12): vfs_close_result_test.o $(CLOSE_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+clean:
+	rm -rf $(SAMPLE_OBJDIR)
+	rm -f $(TARGET) $(TARGET_TEST) $(TARGET_TEST2) $(TARGET_TEST3) \
+		$(TARGET_TEST4) $(TARGET_TEST5) $(TARGET_TEST6) \
+		$(TARGET_TEST7) $(TARGET_TEST8) $(TARGET_TEST9) $(TARGET_TEST10) \
+		$(TARGET_TEST11) $(TARGET_TEST12) $(TARGET_TEST13) $(TARGET_TEST14) $(TARGET_TEST15) $(TARGET_TEST16) $(TARGET_TEST17) $(TARGET_TEST18) $(TARGET_TEST19) \
+	$(TARGET_TEST20) vfs_seek_read_mix_test.o \
+	$(TARGET_TEST21) vfs_write_mix_test.o \
+	$(TARGET_TEST22) vfs_stable_test.o \
+	$(TARGET_TEST23) vfs_size_contract_test.o \
+	$(TARGET_TEST24) vfs_positional_size_test.o \
+	$(TARGET_TEST25) vfs_header_hygiene_test.o \
+	$(BENCH_CRT) $(BENCH_NATIVE) vfs_positional_wide.o \
+	vfs_native_bench.o vfs_native_bench_crt.o $(CRT_VFS_OBJ) $(CLOSE_VFS_OBJ) \
+		$(OBJS) $(FAULT_FS_OBJ) $(RENAME_VFS_OBJ) \
+		$(RA_VFS_OBJ) $(HOOK_VFS_OBJ) rthreads_ra.o retro_eventcount_ra.o \
+		$(NOMMAP_VFS_OBJ) vfs_positional_required.o $(OFF32_VFS_OBJ) \
+		$(PATHREOPEN_VFS_OBJ) $(NTVERIFY_VFS_OBJ)
+	rm -f vfs_positional_off32.bin
+	rm -rf v5_meta_dir
+	rm -f large_3gib.bin large_5gib.bin seek_small.bin seek_4gib.bin
+	rm -f rbuf_fault.txt vfs_readahead_fixture.bin vfs_prefetch_offthread.bin
+	rm -f vfs_view_fixture.bin vfs_view_update.bin vfs_view_empty.bin
+	rm -f rename_replace.bin rename_replace.bin.old rename_replace.bin.old2 rename_replace.bin.tmp RENAME_REPLACE.BIN.OLD
+	rm -f close_result.bin close_result_w.bin
+	rm -f bulk_select.bin bulk_select_w.bin bulk_roundtrip.bin \
+		bulk_short.bin bulk_shrank.bin bulk_error.bin \
+		bulk_binary.bin bulk_threads.bin
+
+.PHONY: clean
+
+win32-stat-contract-check:
+	python3 win32_stat_test.py --cc "$(CC)" --sanitizer "$(SANITIZER)"
+.PHONY: win32-stat-contract-check
+
+# vfs_implementation.c under OpenDingux GCW0's C library, whose <fcntl.h>
+# hides O_CLOEXEC, with the flags its core builds pass
+uclibc-profile-check:
+	$(CC) -fsyntax-only -Iuclibc_sim -I$(LIBRETRO_COMM_DIR)/include \
+		-D_XOPEN_SOURCE=500 -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64 \
+		-Wall -Werror=implicit-function-declaration \
+		$(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+.PHONY: uclibc-profile-check
+
+# The library under a consumer's -D_XOPEN_SOURCE=500 on Darwin (mame2003
+# passes it on every platform): retro_posix_source.h must ask for
+# _DARWIN_C_SOURCE. With MACOS_SDK=<MacOSX*.sdk> the sources cores build
+# are compiled against that SDK too.
+DARWIN_PROFILE_SRCS = \
+	compat/compat_posix_string.c \
+	compat/compat_snprintf.c \
+	compat/compat_strcasestr.c \
+	compat/compat_strl.c \
+	compat/fopen_utf8.c \
+	encodings/encoding_crc32.c \
+	encodings/encoding_deflate.c \
+	encodings/encoding_utf.c \
+	features/features_cpu.c \
+	file/file_path.c \
+	file/file_path_io.c \
+	streams/file_stream.c \
+	streams/file_stream_transforms.c \
+	streams/interface_stream.c \
+	streams/memory_stream.c \
+	streams/rzip_stream.c \
+	streams/stdin_stream.c \
+	streams/trans_stream.c \
+	streams/trans_stream_deflate.c \
+	streams/trans_stream_pipe.c \
+	streams/trans_stream_zlib.c \
+	string/rstrtod.c \
+	string/stdstring.c \
+	time/rtime.c \
+	utils/md5.c \
+	vfs/vfs_implementation.c
+DARWIN_TARGET ?= x86_64-apple-macos10.15
+darwin-profile-check:
+	printf '#include <retro_posix_source.h>\n#ifndef _DARWIN_C_SOURCE\n#error no _DARWIN_C_SOURCE\n#endif\n' | \
+		$(CC) -x c -fsyntax-only -U__linux__ -D__APPLE__ -D_XOPEN_SOURCE=500 \
+		-I$(LIBRETRO_COMM_DIR)/include -
+ifneq ($(MACOS_SDK),)
+	for f in $(DARWIN_PROFILE_SRCS); do \
+		clang -target $(DARWIN_TARGET) -isysroot $(MACOS_SDK) -nostdinc \
+			-isystem $(MACOS_SDK)/usr/include \
+			-isystem $$(clang -print-resource-dir)/include \
+			-F$(MACOS_SDK)/System/Library/Frameworks \
+			-I$(LIBRETRO_COMM_DIR)/include -fsyntax-only -w \
+			-Werror=implicit-function-declaration -D_XOPEN_SOURCE=500 \
+			-DHAVE_ZLIB $(LIBRETRO_COMM_DIR)/$$f || exit 1; \
+	done
+endif
+.PHONY: darwin-profile-check
