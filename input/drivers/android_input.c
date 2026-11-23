@@ -2049,15 +2049,19 @@ typedef char android_key_state_codes_check[
  *   swaps OK and Cancel by default) and the main button in games
  * - Channel Up is Enter, RetroPad Start
  * - Channel Down is Right Shift, RetroPad Select
- * - Back is Escape, Menu Toggle in this build, while a game runs, so the remote can
+ * - Back opens the menu while a game runs (straight through the
+ *   command, so no bind, hotkey or game focus setting can stop it), so the remote can
  *   always get back to the menu; in the menu it stays Back.
  * A mouse's right button arrives as BACK too and is left alone. The
  * keyboard's own keys are untouched, so a remote, a keyboard, a mouse
  * and gamepads all work side by side. */
-static int android_tv_lite_remote_key(int keycode, int source, int action)
+static int android_tv_lite_remote_key(int keycode, int source, int action,
+      int64_t event_time, bool *release_back)
 {
-   /* What the held Back was turned into, so its release matches */
-   static int back_as = 0;
+   /* What the held Back was turned into, so its release matches, and
+    * when it was last pressed */
+   static int back_as          = 0;
+   static int64_t back_down_ns = 0;
 
    switch (keycode)
    {
@@ -2072,7 +2076,17 @@ static int android_tv_lite_remote_key(int keycode, int source, int action)
             return keycode;
          if (action == AKEY_EVENT_ACTION_DOWN)
          {
-            /* The first press decides; key repeats keep it */
+            /* The first press decides and key repeats keep it. A press
+             * long after the last one decides again, so a release that
+             * never came can't leave Back stuck. */
+            if (     back_as
+                  && event_time - back_down_ns > 600000000LL)
+            {
+               if (back_as == AKEYCODE_BACK)
+                  *release_back = true;
+               back_as = 0;
+            }
+            back_down_ns = event_time;
             if (!back_as)
             {
 #ifdef HAVE_MENU
@@ -2081,7 +2095,9 @@ static int android_tv_lite_remote_key(int keycode, int source, int action)
 #else
                bool in_menu = false;
 #endif
-               back_as = in_menu ? AKEYCODE_BACK : AKEYCODE_ESCAPE;
+               back_as = in_menu ? AKEYCODE_BACK : -1;
+               if (!in_menu)
+                  command_event(CMD_EVENT_MENU_TOGGLE, NULL);
             }
             return back_as;
          }
@@ -2107,7 +2123,19 @@ static INLINE void android_input_poll_event_type_key(int port,
 
 #ifdef RARCH_TV_LITE
    if (port == ANDROID_KEYBOARD_PORT)
-      keycode = android_tv_lite_remote_key(keycode, key->source, action);
+   {
+      bool release_back = false;
+      keycode = android_tv_lite_remote_key(keycode, key->source, action,
+            key->event_time, &release_back);
+      if (release_back)
+         android_key_state_write(
+               ANDROID_KEY_ROW(port),
+               ANDROID_KEY_ROW(ANDROID_KEYBOARD_PORT),
+               LAST_KEYCODE, AKEYCODE_BACK, key->source, false);
+      /* taken already (Back opening the menu) */
+      if (keycode < 0)
+         return;
+   }
 #endif
 
    /* a row of keys for each pad slot, and the keyboard's at

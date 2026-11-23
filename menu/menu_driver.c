@@ -23,6 +23,7 @@
 #include <retro_timers.h>
 #include <retro_math.h>
 #include <file/file_path.h>
+#include <retro_dirent.h>
 #include <lists/dir_list.h>
 #include <string/stdstring.h>
 #include <compat/strcasestr.h>
@@ -3848,6 +3849,27 @@ static uint8_t menu_first_run_scan(settings_t *settings)
    return mask;
 }
 
+#ifdef RARCH_TV_LITE
+/* Whether @dir holds no core info file. The core info cache lives in
+ * the same folder, so an empty-folder test is not enough. */
+static bool menu_tv_lite_info_missing(const char *dir)
+{
+   bool missing = true;
+   struct RDIR *rdir;
+
+   if (!*dir || !(rdir = retro_opendir(dir)))
+      return true;
+   while (missing && retro_readdir(rdir))
+   {
+      const char *name = retro_dirent_get_name(rdir);
+      if (name && string_ends_with(name, ".info"))
+         missing = false;
+   }
+   retro_closedir(rdir);
+   return missing;
+}
+#endif
+
 /* Confirmed: push the downloads found at init, through the same path
  * as the Online Updater entries (streamed straight to disk) */
 void menu_first_run_download_start(void)
@@ -3956,9 +3978,9 @@ static bool rarch_menu_init(
    && defined(HAVE_CONFIGFILE)
    /* TV Lite: the core downloader names cores from their info files,
     * and the bundled assets skip the first-run offer above, so fetch
-    * the info files whenever their folder is empty */
+    * the info files whenever their folder has none */
    if (     !(p_dialog->first_run_downloads & MENU_FIRST_RUN_DL_CORE_INFO)
-         && menu_first_run_dir_missing(settings->paths.path_libretro_info))
+         && menu_tv_lite_info_missing(settings->paths.path_libretro_info))
       action_ok_download_bundle(MENU_ENUM_LABEL_CB_UPDATE_CORE_INFO_FILES);
 #endif
 #endif
